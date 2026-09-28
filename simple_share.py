@@ -162,10 +162,10 @@ def print_console_grid(rows):
     label_width = max(len(label) for label, _, _ in normalized)
 
     terminal_width = shutil.get_terminal_size(fallback=(100, 24)).columns
-    table_width = max(36, min(terminal_width, 120))
+    table_width = min(max(terminal_width, 20), 120)
 
     # Bordes + espacios + separador ocupan 7 columnas.
-    max_value_width = max(12, table_width - label_width - 7)
+    max_value_width = max(4, table_width - label_width - 7)
     visible_values = [
         shorten_middle(value, max_value_width)
         for _, value, _ in normalized
