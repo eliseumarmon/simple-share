@@ -1554,8 +1554,6 @@ def run_gui(args):
             self.root = tk.Tk()
             self.root.title("Simple Share")
             self.root.configure(bg=self.BG)
-            self.root.geometry("540x450")
-            self.root.minsize(500, 430)
             self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
             self.status_text = tk.StringVar(value="Detenido")
@@ -1565,7 +1563,24 @@ def run_gui(args):
             self.countdown_text = tk.StringVar(value="Servidor detenido")
 
             self.build()
+            self.fit_window_to_content()
             self.refresh_dynamic()
+
+        def fit_window_to_content(self):
+            """Ajusta la ventana al tamaño real de la interfaz y la centra."""
+            self.root.update_idletasks()
+
+            width = self.root.winfo_reqwidth()
+            height = self.root.winfo_reqheight()
+
+            screen_width = self.root.winfo_screenwidth()
+            screen_height = self.root.winfo_screenheight()
+
+            x = max(0, (screen_width - width) // 2)
+            y = max(0, (screen_height - height) // 2)
+
+            self.root.geometry(f"{width}x{height}+{x}+{y}")
+            self.root.resizable(False, False)
 
         def make_button(self, parent, text, command, primary=False):
             normal = self.PRIMARY if primary else self.SECONDARY
