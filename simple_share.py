@@ -203,11 +203,25 @@ def print_console_grid(rows):
     # Reservamos siempre la última columna. Algunos terminales hacen wrap
     # automático al escribir exactamente en ella, aunque después venga \n.
     safe_width = max(1, terminal_width - 1)
+
+    # En terminales muy estrechos una tabla de dos columnas deja de ser útil.
+    # Cambiamos a una lista compacta que mantiene cada dato en una sola línea.
+    if safe_width < 40:
+        for label, value, target in normalized:
+            prefix = f"{label}: "
+            available = max(1, safe_width - len(prefix))
+            visible = shorten_middle(value, available)
+            linked = console_hyperlink(visible, target)
+
+            if len(prefix) >= safe_width:
+                print(shorten_middle(label, safe_width))
+            else:
+                print(f"{prefix}{linked}")
+        return
+
     table_width = min(safe_width, 120)
 
     # Bordes + espacios + separador ocupan 7 columnas.
-    # Con los labels actuales, incluso una terminal muy estrecha conserva
-    # al menos unas pocas columnas para el valor.
     max_value_width = max(1, table_width - label_width - 7)
     visible_values = [
         shorten_middle(value, max_value_width)
@@ -458,7 +472,7 @@ def is_same_or_child(path: Path, possible_parent: Path) -> bool:
 
 
 class ShareHandler(BaseHTTPRequestHandler):
-    server_version = "SimpleShare/2.11"
+    server_version = "SimpleShare/2.12"
 
     POST_ROUTES = {
         "/api/upload": "handle_upload",
@@ -1390,7 +1404,7 @@ def run_cli(args):
     host = display_host(args.bind)
 
     print()
-    print("Simple Share 2.11")
+    print("Simple Share 2.12")
     print("================")
     print_console_grid(
         [
@@ -1736,7 +1750,7 @@ setInterval(status,500);
     control_url = f"http://127.0.0.1:{control_port}/"
 
     print()
-    print("Simple Share 2.11 · Panel web")
+    print("Simple Share 2.12 · Panel web")
     print("============================")
     print(f"Panel local:  {control_url}")
     print(f"Carpeta:      {ROOT}")
