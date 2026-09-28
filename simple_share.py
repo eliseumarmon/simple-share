@@ -361,7 +361,7 @@ def is_same_or_child(path: Path, possible_parent: Path) -> bool:
 
 
 class ShareHandler(BaseHTTPRequestHandler):
-    server_version = "SimpleShare/2.7"
+    server_version = "SimpleShare/2.8"
 
     POST_ROUTES = {
         "/api/upload": "handle_upload",
@@ -1293,7 +1293,7 @@ def run_cli(args):
     host = display_host(args.bind)
 
     print()
-    print("Simple Share 2.7")
+    print("Simple Share 2.8")
     print("================")
     print_console_grid(
         [
@@ -1633,7 +1633,7 @@ setInterval(status,500);
     control_url = f"http://127.0.0.1:{control_port}/"
 
     print()
-    print("Simple Share 2.7 · Panel web")
+    print("Simple Share 2.8 · Panel web")
     print("============================")
     print(f"Panel local:  {control_url}")
     print(f"Carpeta:      {ROOT}")
@@ -1660,11 +1660,8 @@ def run_gui(args):
         import tkinter as tk
         from tkinter import messagebox
     except ImportError:
-        print(
-            "La interfaz gráfica necesita Tkinter. "
-            "La CLI sigue disponible con: python3 simple_share.py"
-        )
-        return 1
+        print("Tkinter no está disponible; abriendo el panel web local.")
+        return run_web_gui(args)
 
     try:
         configure_runtime(args)
@@ -2079,9 +2076,7 @@ def main():
         return run_web_gui(args)
 
     if args.gui:
-        if os.name == "nt":
-            return run_gui(args)
-        return run_web_gui(args)
+        return run_gui(args)
 
     try:
         run_cli(args)
