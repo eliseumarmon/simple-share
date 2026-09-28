@@ -101,7 +101,7 @@ python3 simple_share.py --web-gui
 At startup, the terminal prints the local URLs and a temporary 6-digit pairing code that rotates every 30 seconds:
 
 ```text
-Simple Share 2.8
+Simple Share 2.9
 ================
 Carpeta:      /home/user/shared
 Puerto:       8000
@@ -183,6 +183,10 @@ simple-share/
 A single log file is reused for each calendar day and new entries are appended to it.
 
 By default, request lines are **not printed to the terminal**, keeping the CLI clean while the OTP refreshes in place on a single line.
+
+The CLI summary table adapts to the current terminal width. Long filesystem paths are shortened in the middle with an ellipsis so the table border stays intact.
+
+On terminals that support OSC 8 hyperlinks, the **shared folder path** is clickable and opens the folder. The **log path** links to the containing `simple_share_logs` directory. Some terminals require Ctrl+click or Cmd+click.
 
 To also print HTTP requests to the terminal:
 
