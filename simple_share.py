@@ -352,11 +352,10 @@ class ShareHandler(BaseHTTPRequestHandler):
             )
             return
 
-        origin = self.headers.get("Origin")
-        if origin and not self.valid_origin():
-            self.send_login_page("Solicitud de acceso no válida.", status=403)
-            return
-
+        # /auth no depende de Origin: algunos navegadores móviles
+        # lo omiten o lo envían de forma distinta en formularios normales.
+        # La protección aquí es OTP + rate limiting. Las operaciones de
+        # archivos siguen exigiendo validación estricta de Origin.
         raw_length = self.headers.get("Content-Length", "0")
         try:
             length = int(raw_length)
