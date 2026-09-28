@@ -296,7 +296,8 @@ class ShareHandler(BaseHTTPRequestHandler):
             )
             return
 
-        if not self.valid_origin():
+        origin = self.headers.get("Origin")
+        if origin and not self.valid_origin():
             self.send_login_page("Solicitud de acceso no válida.", status=403)
             return
 
