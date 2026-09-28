@@ -5,6 +5,7 @@
 import argparse
 import html
 import hmac
+import hashlib
 import json
 import mimetypes
 import os
@@ -25,8 +26,10 @@ ROOT: Path | None = None
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
 JSON_BODY_LIMIT = 64 * 1024
 ACCESS_TOKEN = ""
-ACCESS_CODE = ""
+ACCESS_SECRET = b""
 COOKIE_NAME = "simple_share_auth"
+OTP_STEP_SECONDS = 30
+OTP_DIGITS = 6
 AUTH_WINDOW_SECONDS = 60
 AUTH_MAX_FAILURES = 5
 AUTH_FAILURES: dict[str, list[float]] = {}
@@ -119,6 +122,59 @@ def human_size(size: int) -> str:
     return f"{size} B"
 
 
+def current_access_code(offset: int = 0) -> str:
+    """Genera un código TOTP local de 6 dígitos para el intervalo actual."""
+    counter = int(time.time() // OTP_STEP_SECONDS) + offset
+    message = counter.to_bytes(8, "big")
+    digest = hmac.new(ACCESS_SECRET, message, hashlib.sha1).digest()
+
+    # Truncado dinámico compatible con la idea de RFC 4226/6238.
+    dynamic_offset = digest[-1] & 0x0F
+    value = int.from_bytes(
+        digest[dynamic_offset:dynamic_offset + 4],
+        "big",
+    ) & 0x7FFFFFFF
+
+    return f"{value % (10 ** OTP_DIGITS):0{OTP_DIGITS}d}"
+
+
+def access_code_matches(value: str) -> bool:
+    """
+    Acepta el intervalo actual y el inmediatamente anterior.
+    Así un código no falla si cambia justo mientras se está escribiendo.
+    """
+    if len(value) != OTP_DIGITS or not value.isdigit():
+        return False
+
+    return any(
+        hmac.compare_digest(value, current_access_code(offset))
+        for offset in (0, -1)
+    )
+
+
+def seconds_until_next_code() -> int:
+    remaining = OTP_STEP_SECONDS - int(time.time() % OTP_STEP_SECONDS)
+    return max(1, remaining)
+
+
+def otp_console_loop(stop_event: threading.Event):
+    """Muestra en terminal cada nuevo código al comenzar su intervalo."""
+    current_period = int(time.time() // OTP_STEP_SECONDS)
+
+    while not stop_event.is_set():
+        next_boundary = (current_period + 1) * OTP_STEP_SECONDS
+        wait = max(0.1, next_boundary - time.time() + 0.05)
+
+        if stop_event.wait(wait):
+            return
+
+        current_period = int(time.time() // OTP_STEP_SECONDS)
+        print(
+            f"\nCódigo de acceso actualizado: {current_access_code()} "
+            f"(válido durante {OTP_STEP_SECONDS} s)"
+        )
+
+
 def svg_icon(name: str, css_class: str = "icon") -> str:
     # Iconos SVG inline: cero dependencias, sin CDN ni fuentes externas.
     paths = {
@@ -167,7 +223,7 @@ def is_same_or_child(path: Path, possible_parent: Path) -> bool:
 
 
 class ShareHandler(BaseHTTPRequestHandler):
-    server_version = "SimpleShare/2.2"
+    server_version = "SimpleShare/2.3"
 
     POST_ROUTES = {
         "/api/upload": "handle_upload",
@@ -271,7 +327,7 @@ class ShareHandler(BaseHTTPRequestHandler):
             '.error{margin-bottom:14px;padding:10px 12px;border-radius:9px;background:#3f1d24;'
             'color:#fecaca;font-size:.9rem}</style></head><body><main class="card">'
             '<h1>Simple Share</h1>'
-            '<p>Introduce el código de 6 dígitos que aparece en la terminal del ordenador.</p>'
+            '<p>Introduce el código de 6 dígitos que aparece en la terminal. Cambia cada 30 segundos.</p>'
             f'{error_html}'
             '<form method="post" action="/auth">'
             '<input type="text" name="code" inputmode="numeric" pattern="[0-9]{6}" '
@@ -320,7 +376,7 @@ class ShareHandler(BaseHTTPRequestHandler):
         params = urllib.parse.parse_qs(raw, keep_blank_values=True)
         supplied = params.get("code", [""])[0].strip()
 
-        if not hmac.compare_digest(supplied, ACCESS_CODE):
+        if not access_code_matches(supplied):
             self._record_auth_failure()
             self.send_login_page("Código incorrecto.", status=401)
             return
@@ -1024,7 +1080,7 @@ class ShareServer(ThreadingHTTPServer):
 
 
 def main():
-    global ROOT, MAX_UPLOAD_BYTES, ACCESS_TOKEN
+    global ROOT, MAX_UPLOAD_BYTES, ACCESS_TOKEN, ACCESS_SECRET
 
     parser = argparse.ArgumentParser(
         description=(
@@ -1075,7 +1131,7 @@ def main():
 
     MAX_UPLOAD_BYTES = args.max_upload_mb * 1024 * 1024
     ACCESS_TOKEN = secrets.token_urlsafe(32)
-    ACCESS_CODE = f"{secrets.randbelow(1_000_000):06d}"
+    ACCESS_SECRET = secrets.token_bytes(32)
 
     try:
         server = ShareServer((args.bind, args.port), ShareHandler)
@@ -1086,7 +1142,7 @@ def main():
     ip = local_ip()
 
     print()
-    print("Simple Share 2.2")
+    print("Simple Share 2.3")
     print("================")
     print(f"Carpeta:      {ROOT}")
     print(f"Puerto:       {args.port}")
@@ -1095,19 +1151,31 @@ def main():
     print(f"Este equipo:  http://127.0.0.1:{args.port}/")
     print(f"Red local:    http://{ip}:{args.port}/")
     print()
-    print(f"Código de acceso: {ACCESS_CODE}")
-    print("El código y la sesión cambian cada vez que se inicia el servidor.")
+    print(
+        f"Código de acceso: {current_access_code()} "
+        f"(cambia en {seconds_until_next_code()} s)"
+    )
+    print("El código cambia cada 30 s; la sesión del navegador permanece activa.")
     print()
     print("Funciones: subir, descargar, crear carpetas, mover, copiar, renombrar y eliminar.")
     print("Uso recomendado: redes locales de confianza. No expongas este puerto a Internet.")
     print("Ctrl+C para detener.")
     print()
 
+    otp_stop = threading.Event()
+    otp_thread = threading.Thread(
+        target=otp_console_loop,
+        args=(otp_stop,),
+        daemon=True,
+    )
+    otp_thread.start()
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nServidor detenido.")
     finally:
+        otp_stop.set()
         server.server_close()
 
 
