@@ -2,7 +2,7 @@
 
 A small, zero-dependency Python file server for sharing files across a trusted local network from any modern browser.
 
-Simple Share turns a folder on your computer into a lightweight web file manager. Open the temporary URL shown in the terminal from your phone, tablet, or another computer and you can upload, download, organize, move, copy, rename, and delete files without installing an app on the client device.
+Simple Share turns a folder on your computer into a lightweight web file manager. Open the LAN URL shown in the terminal from your phone, tablet, or another computer, enter the short pairing code, and you can upload, download, organize, move, copy, rename, and delete files without installing an app on the client device.
 
 Everything lives in a single Python file and uses only the Python standard library.
 
@@ -189,6 +189,7 @@ Simple Share is intentionally built without a web framework. It uses Python's st
 The server exposes a small internal API:
 
 ```text
+POST /auth
 GET  /api/directories
 POST /api/upload
 POST /api/mkdir
