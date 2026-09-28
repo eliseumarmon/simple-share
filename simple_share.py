@@ -29,7 +29,7 @@ from datetime import datetime
 
 
 APP_NAME = "Simple Share"
-APP_VERSION = "2.14"
+APP_VERSION = "2.15"
 
 ROOT: Path | None = None
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
@@ -58,15 +58,15 @@ def script_directory() -> Path:
     return Path(__file__).resolve().parent
 
 
-def terminal_dimensions() -> tuple[int, int]:
+def terminal_width() -> int:
     """
-    Devuelve un área segura de dibujo.
+    Devuelve el ancho seguro de dibujo.
 
-    Reservamos una columna para evitar el wrap automático de algunos
-    terminales al escribir exactamente en la última celda.
+    La altura no condiciona el layout. Reservamos una columna para evitar
+    el wrap automático de algunos terminales en la última celda.
     """
-    size = shutil.get_terminal_size(fallback=(100, 24))
-    return max(1, size.columns - 1), max(1, size.lines)
+    columns = shutil.get_terminal_size(fallback=(100, 24)).columns
+    return max(1, columns - 1)
 
 
 def shorten_middle(value: str, max_width: int) -> str:
@@ -288,83 +288,53 @@ def build_explanation_lines(max_width: int) -> list[str]:
     return lines
 
 
-def build_console_dashboard(rows, width: int, height: int) -> list[str]:
+def build_console_dashboard(rows, width: int) -> list[str]:
     """
-    Construye todo el dashboard dentro del ancho y alto disponibles.
+    Construye el dashboard completo para el ancho disponible.
 
-    En terminales normales mantiene: cuadrícula -> explicación -> OTP.
-    Si falta altura degrada progresivamente sin hacer scroll.
+    El ancho es responsivo; la altura de la terminal no altera el contenido.
     """
     title = f"{APP_NAME} {APP_VERSION}"
     status = current_console_status(width)
 
-    if height <= 1:
-        return [status]
+    if width < 18:
+        main = [
+            shorten_end(title, width),
+            *build_compact_rows(rows, width),
+        ]
+    else:
+        main = build_console_grid(rows, width, title)
 
-    if height == 2:
-        return [shorten_end(title, width), status]
-
-    grid = build_console_grid(rows, width, title)
-
-    # Si la cuadrícula cabe, es la representación preferida.
-    if len(grid) + 1 <= height:
-        lines = list(grid)
-        remaining = height - len(lines) - 1  # siempre reservamos OTP
-
-        explanations = build_explanation_lines(width)
-        if remaining >= 2 and explanations:
-            lines.append("")
-            remaining -= 1
-
-            for line in explanations:
-                if remaining <= 0:
-                    break
-                lines.append(shorten_end(line, width))
-                remaining -= 1
-
-            if remaining > 0:
-                lines.append("")
-
-        lines.append(status)
-        return lines[:height]
-
-    # Poca altura: título + datos prioritarios + OTP.
-    compact = build_compact_rows(rows, width)
-    priority = [0, 2, 3, 4, 1]  # puerto es redundante con las URLs
-    compact = [compact[i] for i in priority if i < len(compact)]
-
-    available_rows = max(0, height - 2)
     return [
-        shorten_end(title, width),
-        *compact[:available_rows],
+        *main,
+        "",
+        *build_explanation_lines(width),
+        "",
         status,
     ]
 
 
 class ConsoleDashboard:
-    """Dashboard responsivo que conserva los logs por encima de él."""
+    """Dashboard responsivo únicamente al ancho de la terminal."""
 
     def __init__(self, rows):
         self.rows = rows
         self.active = False
         self.rendered_lines = 0
-        self.last_size: tuple[int, int] | None = None
+        self.last_width: int | None = None
         self.last_status = ""
         self.dynamic = bool(sys.stdout is not None and sys.stdout.isatty())
 
-    def _size(self) -> tuple[int, int]:
-        return terminal_dimensions()
+    def _width(self) -> int:
+        return terminal_width()
 
-    def _lines(self, size: tuple[int, int]) -> list[str]:
-        width, height = size
-        return build_console_dashboard(self.rows, width, height)
+    def _lines(self, width: int) -> list[str]:
+        return build_console_dashboard(self.rows, width)
 
     def _erase_unlocked(self):
         if not self.dynamic or self.rendered_lines <= 0 or sys.stdout is None:
             return
 
-        # El cursor queda siempre en la última línea del dashboard.
-        # Borramos hacia arriba sin afectar a los logs anteriores.
         for index in range(self.rendered_lines):
             sys.stdout.write("\r\033[2K")
             if index < self.rendered_lines - 1:
@@ -375,20 +345,18 @@ class ConsoleDashboard:
 
     def _render_full_unlocked(
         self,
-        size: tuple[int, int] | None = None,
+        width: int | None = None,
         clear_screen: bool = False,
     ):
         if sys.stdout is None:
             return
 
-        size = size or self._size()
-        lines = self._lines(size)
+        width = width or self._width()
+        lines = self._lines(width)
 
         if self.dynamic:
             if clear_screen:
-                # Al cambiar el ancho, el terminal puede haber refluido las
-                # líneas anteriores. Limpiar la pantalla evita depender de
-                # cuántas filas visuales ocupaban antes del resize.
+                # El cambio de ancho puede refluir las líneas anteriores.
                 sys.stdout.write("\033[2J\033[H")
                 self.rendered_lines = 0
             else:
@@ -401,7 +369,7 @@ class ConsoleDashboard:
             sys.stdout.write("\n".join(lines) + "\n")
             sys.stdout.flush()
 
-        self.last_size = size
+        self.last_width = width
         self.last_status = lines[-1] if lines else ""
 
     def start(self):
@@ -414,14 +382,13 @@ class ConsoleDashboard:
             return
 
         with CONSOLE_LOCK:
-            size = self._size()
+            width = self._width()
 
-            # El ancho o el alto han cambiado: limpiamos y reconstruimos TODO.
-            if size != self.last_size:
-                self._render_full_unlocked(size, clear_screen=True)
+            # Solo el ancho provoca una reconstrucción completa.
+            if width != self.last_width:
+                self._render_full_unlocked(width, clear_screen=True)
                 return
 
-            width, _height = size
             status = current_console_status(width)
 
             # Sin resize solo cambia la última línea: evitamos parpadeos.
@@ -443,7 +410,7 @@ class ConsoleDashboard:
             self._erase_unlocked()
             sys.stdout.write(message + "\n")
             sys.stdout.flush()
-            self.last_size = None
+            self.last_width = None
             self.last_status = ""
             self._render_full_unlocked()
 
@@ -453,7 +420,7 @@ class ConsoleDashboard:
                 self._erase_unlocked()
 
             self.active = False
-            self.last_size = None
+            self.last_width = None
             self.last_status = ""
 
 
@@ -631,7 +598,7 @@ def console_dashboard_loop(
     stop_event: threading.Event,
     dashboard: ConsoleDashboard,
 ):
-    """Refresca OTP y redibuja el dashboard cuando cambia el tamaño."""
+    """Refresca el OTP y redibuja el dashboard cuando cambia el ancho."""
     dashboard.start()
 
     try:
