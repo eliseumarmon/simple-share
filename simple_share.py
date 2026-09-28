@@ -199,10 +199,16 @@ def print_console_grid(rows):
     label_width = max(len(label) for label, _, _ in normalized)
 
     terminal_width = shutil.get_terminal_size(fallback=(100, 24)).columns
-    table_width = min(max(terminal_width, 20), 120)
+
+    # Reservamos siempre la última columna. Algunos terminales hacen wrap
+    # automático al escribir exactamente en ella, aunque después venga \n.
+    safe_width = max(1, terminal_width - 1)
+    table_width = min(safe_width, 120)
 
     # Bordes + espacios + separador ocupan 7 columnas.
-    max_value_width = max(4, table_width - label_width - 7)
+    # Con los labels actuales, incluso una terminal muy estrecha conserva
+    # al menos unas pocas columnas para el valor.
+    max_value_width = max(1, table_width - label_width - 7)
     visible_values = [
         shorten_middle(value, max_value_width)
         for _, value, _ in normalized
@@ -452,7 +458,7 @@ def is_same_or_child(path: Path, possible_parent: Path) -> bool:
 
 
 class ShareHandler(BaseHTTPRequestHandler):
-    server_version = "SimpleShare/2.10"
+    server_version = "SimpleShare/2.11"
 
     POST_ROUTES = {
         "/api/upload": "handle_upload",
@@ -1384,7 +1390,7 @@ def run_cli(args):
     host = display_host(args.bind)
 
     print()
-    print("Simple Share 2.10")
+    print("Simple Share 2.11")
     print("================")
     print_console_grid(
         [
@@ -1730,7 +1736,7 @@ setInterval(status,500);
     control_url = f"http://127.0.0.1:{control_port}/"
 
     print()
-    print("Simple Share 2.10 · Panel web")
+    print("Simple Share 2.11 · Panel web")
     print("============================")
     print(f"Panel local:  {control_url}")
     print(f"Carpeta:      {ROOT}")
