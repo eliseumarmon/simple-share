@@ -138,7 +138,7 @@ def configure_request_logging(verbose: bool = False) -> Path:
     file_handler.setFormatter(formatter)
     REQUEST_LOGGER.addHandler(file_handler)
 
-    if verbose:
+    if verbose and sys.stdout is not None:
         console_handler = StatusAwareConsoleHandler(sys.stdout)
         console_handler.setFormatter(formatter)
         REQUEST_LOGGER.addHandler(console_handler)
