@@ -12,11 +12,13 @@ import os
 import secrets
 import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
 import urllib.parse
 import uuid
+import webbrowser
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -223,7 +225,7 @@ def is_same_or_child(path: Path, possible_parent: Path) -> bool:
 
 
 class ShareHandler(BaseHTTPRequestHandler):
-    server_version = "SimpleShare/2.3"
+    server_version = "SimpleShare/2.4"
 
     POST_ROUTES = {
         "/api/upload": "handle_upload",
@@ -1074,39 +1076,12 @@ class ShareServer(ThreadingHTTPServer):
 
 
 # ============================================================
-# Main
+# Arranque CLI / GUI
 # ============================================================
 
 
-def main():
-    global ROOT, MAX_UPLOAD_BYTES, ACCESS_TOKEN, ACCESS_SECRET
-
-    parser = argparse.ArgumentParser(
-        description=(
-            "Servidor HTTP sencillo para compartir archivos entre dispositivos. "
-            "Por defecto utiliza ~/shared en Linux/macOS y C:\\shared en Windows."
-        )
-    )
-
-    parser.add_argument(
-        "directory",
-        nargs="?",
-        default=None,
-        help=(
-            "Carpeta que quieres compartir. Si se omite, usa ~/shared "
-            "en Linux/macOS y C:\\shared en Windows."
-        ),
-    )
-    parser.add_argument("-p", "--port", type=int, default=8000, help="Puerto HTTP (default: 8000)")
-    parser.add_argument("-b", "--bind", default="0.0.0.0", help="IP donde escuchar (default: 0.0.0.0)")
-    parser.add_argument(
-        "--max-upload-mb",
-        type=int,
-        default=2048,
-        help="Tamaño máximo por archivo en MB (default: 2048)",
-    )
-
-    args = parser.parse_args()
+def configure_runtime(args):
+    global ROOT, MAX_UPLOAD_BYTES
 
     ROOT = (
         Path(args.directory).expanduser().resolve()
@@ -1117,38 +1092,71 @@ def main():
     try:
         ROOT.mkdir(parents=True, exist_ok=True)
     except OSError as exc:
-        print(f"No se pudo crear la carpeta {ROOT}: {exc}")
-        sys.exit(1)
+        raise RuntimeError(f"No se pudo crear la carpeta {ROOT}: {exc}") from exc
 
     if not ROOT.is_dir():
-        print(f"No es una carpeta: {ROOT}")
-        sys.exit(1)
+        raise RuntimeError(f"No es una carpeta: {ROOT}")
 
     if args.max_upload_mb <= 0:
-        print("--max-upload-mb debe ser mayor que 0")
-        sys.exit(1)
+        raise RuntimeError("--max-upload-mb debe ser mayor que 0")
 
     MAX_UPLOAD_BYTES = args.max_upload_mb * 1024 * 1024
+
+
+def reset_auth():
+    global ACCESS_TOKEN, ACCESS_SECRET
+
     ACCESS_TOKEN = secrets.token_urlsafe(32)
     ACCESS_SECRET = secrets.token_bytes(32)
 
-    try:
-        server = ShareServer((args.bind, args.port), ShareHandler)
-    except OSError as exc:
-        print(f"No se pudo iniciar el servidor: {exc}")
-        sys.exit(1)
+    with AUTH_LOCK:
+        AUTH_FAILURES.clear()
 
-    ip = local_ip()
+
+def display_host(bind: str) -> str:
+    if bind in ("0.0.0.0", "::"):
+        return local_ip()
+    return bind
+
+
+def create_server(args) -> ShareServer:
+    reset_auth()
+
+    try:
+        return ShareServer((args.bind, args.port), ShareHandler)
+    except OSError as exc:
+        raise RuntimeError(f"No se pudo iniciar el servidor: {exc}") from exc
+
+
+def open_shared_folder():
+    folder = str(require_root())
+
+    if os.name == "nt":
+        os.startfile(folder)
+        return
+
+    command = ["open", folder] if sys.platform == "darwin" else ["xdg-open", folder]
+    subprocess.Popen(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def run_cli(args):
+    configure_runtime(args)
+    server = create_server(args)
+    host = display_host(args.bind)
 
     print()
-    print("Simple Share 2.3")
+    print("Simple Share 2.4")
     print("================")
     print(f"Carpeta:      {ROOT}")
     print(f"Puerto:       {args.port}")
     print()
     print("Abre Simple Share desde el navegador:")
     print(f"Este equipo:  http://127.0.0.1:{args.port}/")
-    print(f"Red local:    http://{ip}:{args.port}/")
+    print(f"Red local:    http://{host}:{args.port}/")
     print()
     print(
         f"Código de acceso: {current_access_code()} "
@@ -1178,5 +1186,405 @@ def main():
         server.server_close()
 
 
+def run_gui(args):
+    try:
+        import tkinter as tk
+        from tkinter import messagebox
+    except ImportError:
+        print(
+            "La interfaz gráfica necesita Tkinter. "
+            "La CLI sigue disponible con: python3 simple_share.py"
+        )
+        return 1
+
+    try:
+        configure_runtime(args)
+    except RuntimeError as exc:
+        try:
+            temp = tk.Tk()
+            temp.withdraw()
+            messagebox.showerror("Simple Share", str(exc))
+            temp.destroy()
+        except Exception:
+            print(exc)
+        return 1
+
+    class SimpleShareGUI:
+        BG = "#111827"
+        PANEL = "#1f2937"
+        BORDER = "#374151"
+        TEXT = "#e5e7eb"
+        MUTED = "#9ca3af"
+        PRIMARY = "#2563eb"
+        PRIMARY_HOVER = "#1d4ed8"
+        SECONDARY = "#374151"
+        SECONDARY_HOVER = "#4b5563"
+        SUCCESS = "#22c55e"
+        STOPPED = "#6b7280"
+
+        def __init__(self):
+            self.server = None
+            self.server_thread = None
+            self.url = f"http://{display_host(args.bind)}:{args.port}/"
+
+            self.root = tk.Tk()
+            self.root.title("Simple Share")
+            self.root.configure(bg=self.BG)
+            self.root.geometry("540x450")
+            self.root.minsize(500, 430)
+            self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+            self.status_text = tk.StringVar(value="Detenido")
+            self.url_text = tk.StringVar(value=self.url)
+            self.folder_text = tk.StringVar(value=str(require_root()))
+            self.otp_text = tk.StringVar(value="--- ---")
+            self.countdown_text = tk.StringVar(value="Servidor detenido")
+
+            self.build()
+            self.refresh_dynamic()
+
+        def make_button(self, parent, text, command, primary=False):
+            normal = self.PRIMARY if primary else self.SECONDARY
+            hover = self.PRIMARY_HOVER if primary else self.SECONDARY_HOVER
+
+            button = tk.Button(
+                parent,
+                text=text,
+                command=command,
+                bg=normal,
+                fg="white",
+                activebackground=hover,
+                activeforeground="white",
+                disabledforeground="#6b7280",
+                relief="flat",
+                bd=0,
+                padx=16,
+                pady=12,
+                font=("Segoe UI", 10, "bold"),
+                cursor="hand2",
+            )
+
+            button.bind("<Enter>", lambda _e: button.config(bg=hover) if button["state"] == "normal" else None)
+            button.bind("<Leave>", lambda _e: button.config(bg=normal) if button["state"] == "normal" else None)
+            return button
+
+        def make_readonly_entry(self, parent, variable):
+            entry = tk.Entry(
+                parent,
+                textvariable=variable,
+                state="readonly",
+                readonlybackground=self.BG,
+                fg=self.TEXT,
+                relief="flat",
+                bd=0,
+                font=("Consolas", 10),
+            )
+            return entry
+
+        def build(self):
+            outer = tk.Frame(self.root, bg=self.BG, padx=24, pady=22)
+            outer.pack(fill="both", expand=True)
+
+            header = tk.Frame(outer, bg=self.BG)
+            header.pack(fill="x")
+
+            tk.Label(
+                header,
+                text="Simple Share",
+                bg=self.BG,
+                fg=self.TEXT,
+                font=("Segoe UI", 20, "bold"),
+            ).pack(side="left")
+
+            status_wrap = tk.Frame(header, bg=self.BG)
+            status_wrap.pack(side="right", pady=5)
+
+            self.status_dot = tk.Canvas(
+                status_wrap,
+                width=14,
+                height=14,
+                bg=self.BG,
+                highlightthickness=0,
+            )
+            self.status_dot.pack(side="left", padx=(0, 7))
+            self.status_circle = self.status_dot.create_oval(
+                2, 2, 12, 12,
+                fill=self.STOPPED,
+                outline="",
+            )
+
+            tk.Label(
+                status_wrap,
+                textvariable=self.status_text,
+                bg=self.BG,
+                fg=self.TEXT,
+                font=("Segoe UI", 10, "bold"),
+            ).pack(side="left")
+
+            card = tk.Frame(
+                outer,
+                bg=self.PANEL,
+                highlightbackground=self.BORDER,
+                highlightthickness=1,
+                padx=20,
+                pady=18,
+            )
+            card.pack(fill="x", pady=(22, 16))
+
+            tk.Label(
+                card,
+                text="Código de acceso",
+                bg=self.PANEL,
+                fg=self.MUTED,
+                font=("Segoe UI", 9),
+            ).pack()
+
+            tk.Label(
+                card,
+                textvariable=self.otp_text,
+                bg=self.PANEL,
+                fg=self.TEXT,
+                font=("Consolas", 28, "bold"),
+            ).pack(pady=(4, 2))
+
+            tk.Label(
+                card,
+                textvariable=self.countdown_text,
+                bg=self.PANEL,
+                fg=self.MUTED,
+                font=("Segoe UI", 9),
+            ).pack()
+
+            info = tk.Frame(outer, bg=self.BG)
+            info.pack(fill="x", pady=(0, 18))
+
+            tk.Label(
+                info,
+                text="URL local",
+                bg=self.BG,
+                fg=self.MUTED,
+                anchor="w",
+                font=("Segoe UI", 9),
+            ).pack(fill="x")
+            self.make_readonly_entry(info, self.url_text).pack(fill="x", pady=(2, 10))
+
+            tk.Label(
+                info,
+                text="Carpeta compartida",
+                bg=self.BG,
+                fg=self.MUTED,
+                anchor="w",
+                font=("Segoe UI", 9),
+            ).pack(fill="x")
+            self.make_readonly_entry(info, self.folder_text).pack(fill="x", pady=(2, 0))
+
+            buttons = tk.Frame(outer, bg=self.BG)
+            buttons.pack(fill="x")
+            buttons.columnconfigure(0, weight=1)
+            buttons.columnconfigure(1, weight=1)
+
+            self.start_button = self.make_button(
+                buttons,
+                "Iniciar",
+                self.start_server,
+                primary=True,
+            )
+            self.start_button.grid(row=0, column=0, sticky="ew", padx=(0, 6), pady=(0, 8))
+
+            self.stop_button = self.make_button(
+                buttons,
+                "Detener",
+                self.stop_server,
+            )
+            self.stop_button.grid(row=0, column=1, sticky="ew", padx=(6, 0), pady=(0, 8))
+
+            self.folder_button = self.make_button(
+                buttons,
+                "Abrir carpeta",
+                self.open_folder,
+            )
+            self.folder_button.grid(row=1, column=0, sticky="ew", padx=(0, 6))
+
+            self.browser_button = self.make_button(
+                buttons,
+                "Abrir navegador",
+                self.open_browser,
+            )
+            self.browser_button.grid(row=1, column=1, sticky="ew", padx=(6, 0))
+
+            self.apply_state()
+
+        @property
+        def running(self):
+            return self.server is not None
+
+        def apply_state(self):
+            running = self.running
+
+            self.status_text.set("Activo" if running else "Detenido")
+            self.status_dot.itemconfigure(
+                self.status_circle,
+                fill=self.SUCCESS if running else self.STOPPED,
+            )
+
+            self.start_button.config(state="disabled" if running else "normal")
+            self.stop_button.config(state="normal" if running else "disabled")
+            self.browser_button.config(state="normal" if running else "disabled")
+
+        def start_server(self):
+            if self.running:
+                return
+
+            try:
+                server = create_server(args)
+            except RuntimeError as exc:
+                messagebox.showerror("Simple Share", str(exc), parent=self.root)
+                return
+
+            self.server = server
+            self.server_thread = threading.Thread(
+                target=server.serve_forever,
+                daemon=True,
+                name="simple-share-http",
+            )
+            self.server_thread.start()
+            self.apply_state()
+            self.refresh_dynamic()
+
+        def stop_server(self):
+            if not self.running:
+                return
+
+            server = self.server
+            self.server = None
+            self.server_thread = None
+            self.apply_state()
+            self.otp_text.set("--- ---")
+            self.countdown_text.set("Servidor detenido")
+
+            def shutdown():
+                server.shutdown()
+                server.server_close()
+
+            threading.Thread(
+                target=shutdown,
+                daemon=True,
+                name="simple-share-shutdown",
+            ).start()
+
+        def open_folder(self):
+            try:
+                open_shared_folder()
+            except Exception as exc:
+                messagebox.showerror(
+                    "Simple Share",
+                    f"No se pudo abrir la carpeta:\n{exc}",
+                    parent=self.root,
+                )
+
+        def open_browser(self):
+            if self.running:
+                webbrowser.open(self.url)
+
+        def refresh_dynamic(self):
+            if self.running:
+                code = current_access_code()
+                self.otp_text.set(f"{code[:3]} {code[3:]}")
+                remaining = seconds_until_next_code()
+                self.countdown_text.set(
+                    f"Cambia en {remaining} s · la sesión ya iniciada permanece activa"
+                )
+
+            self.root.after(250, self.refresh_dynamic)
+
+        def on_close(self):
+            if self.running:
+                should_close = messagebox.askyesno(
+                    "Simple Share",
+                    "El servidor está activo. ¿Detenerlo y salir?",
+                    parent=self.root,
+                )
+                if not should_close:
+                    return
+
+                server = self.server
+                self.server = None
+                try:
+                    server.shutdown()
+                    server.server_close()
+                except Exception:
+                    pass
+
+            self.root.destroy()
+
+        def run(self):
+            self.root.mainloop()
+
+    app = SimpleShareGUI()
+    app.run()
+    return 0
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Servidor HTTP sencillo para compartir archivos entre dispositivos. "
+            "Por defecto utiliza ~/shared en Linux/macOS y C:\\shared en Windows."
+        )
+    )
+
+    parser.add_argument(
+        "directory",
+        nargs="?",
+        default=None,
+        help=(
+            "Carpeta que quieres compartir. Si se omite, usa ~/shared "
+            "en Linux/macOS y C:\\shared en Windows."
+        ),
+    )
+    parser.add_argument(
+        "-p",
+        "--port",
+        type=int,
+        default=8000,
+        help="Puerto HTTP (default: 8000)",
+    )
+    parser.add_argument(
+        "-b",
+        "--bind",
+        default="0.0.0.0",
+        help="IP donde escuchar (default: 0.0.0.0)",
+    )
+    parser.add_argument(
+        "--max-upload-mb",
+        type=int,
+        default=2048,
+        help="Tamaño máximo por archivo en MB (default: 2048)",
+    )
+    parser.add_argument(
+        "--gui",
+        action="store_true",
+        help="Abrir la interfaz gráfica de control",
+    )
+
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.gui:
+        return run_gui(args)
+
+    try:
+        run_cli(args)
+    except RuntimeError as exc:
+        print(exc)
+        return 1
+
+    return 0
+
+
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
