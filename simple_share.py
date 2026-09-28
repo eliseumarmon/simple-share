@@ -55,33 +55,70 @@ def script_directory() -> Path:
     return Path(__file__).resolve().parent
 
 
+def console_status_width() -> int:
+    """Ancho seguro para evitar que la línea dinámica haga wrap."""
+    columns = shutil.get_terminal_size(fallback=(80, 24)).columns
+
+    # Evitamos ocupar la última columna: algunos terminales hacen wrap
+    # automáticamente justo al escribir en ella.
+    return max(1, columns - 1)
+
+
 def current_console_status() -> str:
     code = current_access_code()
-    return (
-        f"Código de acceso LAN: {code} · "
-        f"cambia en {seconds_until_next_code():02d} s"
-    )
+    remaining = seconds_until_next_code()
+    max_width = console_status_width()
+
+    variants = [
+        f"Código de acceso LAN: {code} · cambia en {remaining:02d} s",
+        f"OTP LAN: {code} · {remaining:02d} s",
+        f"OTP {code} · {remaining:02d}s",
+        f"{code} · {remaining:02d}s",
+        code,
+    ]
+
+    for text in variants:
+        if len(text) <= max_width:
+            return text
+
+    return code[:max_width]
 
 
 def _clear_console_status_unlocked():
     global CONSOLE_STATUS_WIDTH
 
-    if not CONSOLE_STATUS_ACTIVE or CONSOLE_STATUS_WIDTH <= 0:
+    if not CONSOLE_STATUS_ACTIVE or sys.stdout is None:
         return
 
-    sys.stdout.write("\r" + (" " * CONSOLE_STATUS_WIDTH) + "\r")
+    current_width = console_status_width()
+
+    if sys.stdout.isatty():
+        # Borra la línea completa sin imprimir una cadena de espacios que
+        # podría volver a provocar wrap en terminales estrechos.
+        sys.stdout.write("\r\033[2K")
+    elif CONSOLE_STATUS_WIDTH > 0:
+        clear_width = min(CONSOLE_STATUS_WIDTH, current_width)
+        sys.stdout.write("\r" + (" " * clear_width) + "\r")
+
     sys.stdout.flush()
+    CONSOLE_STATUS_WIDTH = 0
 
 
 def _draw_console_status_unlocked():
     global CONSOLE_STATUS_WIDTH
 
-    if not CONSOLE_STATUS_ACTIVE:
+    if not CONSOLE_STATUS_ACTIVE or sys.stdout is None:
         return
 
     text = current_console_status()
-    CONSOLE_STATUS_WIDTH = max(CONSOLE_STATUS_WIDTH, len(text))
-    sys.stdout.write("\r" + text.ljust(CONSOLE_STATUS_WIDTH))
+
+    # El ancho puede cambiar en cualquier momento al redimensionar la ventana.
+    # Limpiamos primero y recalculamos en cada refresco.
+    _clear_console_status_unlocked()
+    text = text[:console_status_width()]
+    CONSOLE_STATUS_WIDTH = len(text)
+
+    sys.stdout.write("\r" + text)
     sys.stdout.flush()
 
 
@@ -415,7 +452,7 @@ def is_same_or_child(path: Path, possible_parent: Path) -> bool:
 
 
 class ShareHandler(BaseHTTPRequestHandler):
-    server_version = "SimpleShare/2.9"
+    server_version = "SimpleShare/2.10"
 
     POST_ROUTES = {
         "/api/upload": "handle_upload",
@@ -1347,7 +1384,7 @@ def run_cli(args):
     host = display_host(args.bind)
 
     print()
-    print("Simple Share 2.9")
+    print("Simple Share 2.10")
     print("================")
     print_console_grid(
         [
@@ -1693,7 +1730,7 @@ setInterval(status,500);
     control_url = f"http://127.0.0.1:{control_port}/"
 
     print()
-    print("Simple Share 2.9 · Panel web")
+    print("Simple Share 2.10 · Panel web")
     print("============================")
     print(f"Panel local:  {control_url}")
     print(f"Carpeta:      {ROOT}")
