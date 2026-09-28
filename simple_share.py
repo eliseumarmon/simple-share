@@ -7,6 +7,7 @@ import html
 import hmac
 import hashlib
 import json
+import logging
 import mimetypes
 import os
 import secrets
@@ -22,6 +23,7 @@ import webbrowser
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from datetime import datetime
 
 
 ROOT: Path | None = None
@@ -36,6 +38,112 @@ AUTH_WINDOW_SECONDS = 60
 AUTH_MAX_FAILURES = 5
 AUTH_FAILURES: dict[str, list[float]] = {}
 AUTH_LOCK = threading.Lock()
+REQUEST_LOGGER = logging.getLogger("simple_share.requests")
+REQUEST_LOG_PATH: Path | None = None
+CONSOLE_STATUS_LOCK = threading.RLock()
+CONSOLE_STATUS_ACTIVE = False
+CONSOLE_STATUS_WIDTH = 0
+
+
+# ============================================================
+# Registro y estado de consola
+# ============================================================
+
+
+def script_directory() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def current_console_status() -> str:
+    code = current_access_code()
+    return (
+        f"Código de acceso: {code} · "
+        f"cambia en {seconds_until_next_code():02d} s"
+    )
+
+
+def _clear_console_status_unlocked():
+    global CONSOLE_STATUS_WIDTH
+
+    if not CONSOLE_STATUS_ACTIVE or CONSOLE_STATUS_WIDTH <= 0:
+        return
+
+    sys.stdout.write("\r" + (" " * CONSOLE_STATUS_WIDTH) + "\r")
+    sys.stdout.flush()
+
+
+def _draw_console_status_unlocked():
+    global CONSOLE_STATUS_WIDTH
+
+    if not CONSOLE_STATUS_ACTIVE:
+        return
+
+    text = current_console_status()
+    CONSOLE_STATUS_WIDTH = max(CONSOLE_STATUS_WIDTH, len(text))
+    sys.stdout.write("\r" + text.ljust(CONSOLE_STATUS_WIDTH))
+    sys.stdout.flush()
+
+
+def draw_console_status():
+    with CONSOLE_STATUS_LOCK:
+        _draw_console_status_unlocked()
+
+
+def finish_console_status():
+    global CONSOLE_STATUS_ACTIVE, CONSOLE_STATUS_WIDTH
+
+    with CONSOLE_STATUS_LOCK:
+        _clear_console_status_unlocked()
+        CONSOLE_STATUS_ACTIVE = False
+        CONSOLE_STATUS_WIDTH = 0
+
+
+class StatusAwareConsoleHandler(logging.StreamHandler):
+    """Escribe logs sin dejar rota la línea dinámica del OTP."""
+
+    def emit(self, record):
+        try:
+            message = self.format(record)
+
+            with CONSOLE_STATUS_LOCK:
+                _clear_console_status_unlocked()
+                self.stream.write(message + self.terminator)
+                self.flush()
+                _draw_console_status_unlocked()
+        except Exception:
+            self.handleError(record)
+
+
+def configure_request_logging(verbose: bool = False) -> Path:
+    global REQUEST_LOG_PATH
+
+    log_dir = script_directory() / "simple_share_logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    REQUEST_LOG_PATH = log_dir / f"simple_share_{datetime.now():%Y-%m-%d}.log"
+
+    REQUEST_LOGGER.handlers.clear()
+    REQUEST_LOGGER.setLevel(logging.INFO)
+    REQUEST_LOGGER.propagate = False
+
+    formatter = logging.Formatter(
+        "%(asctime)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    file_handler = logging.FileHandler(
+        REQUEST_LOG_PATH,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(formatter)
+    REQUEST_LOGGER.addHandler(file_handler)
+
+    if verbose:
+        console_handler = StatusAwareConsoleHandler(sys.stdout)
+        console_handler.setFormatter(formatter)
+        REQUEST_LOGGER.addHandler(console_handler)
+
+    return REQUEST_LOG_PATH
 
 
 # ============================================================
@@ -160,21 +268,18 @@ def seconds_until_next_code() -> int:
 
 
 def otp_console_loop(stop_event: threading.Event):
-    """Muestra en terminal cada nuevo código al comenzar su intervalo."""
-    current_period = int(time.time() // OTP_STEP_SECONDS)
+    """Mantiene el OTP y su cuenta atrás en una única línea de consola."""
+    global CONSOLE_STATUS_ACTIVE
 
-    while not stop_event.is_set():
-        next_boundary = (current_period + 1) * OTP_STEP_SECONDS
-        wait = max(0.1, next_boundary - time.time() + 0.05)
+    with CONSOLE_STATUS_LOCK:
+        CONSOLE_STATUS_ACTIVE = True
+        _draw_console_status_unlocked()
 
-        if stop_event.wait(wait):
-            return
-
-        current_period = int(time.time() // OTP_STEP_SECONDS)
-        print(
-            f"\nCódigo de acceso actualizado: {current_access_code()} "
-            f"(válido durante {OTP_STEP_SECONDS} s)"
-        )
+    try:
+        while not stop_event.wait(0.25):
+            draw_console_status()
+    finally:
+        finish_console_status()
 
 
 def svg_icon(name: str, css_class: str = "icon") -> str:
@@ -237,7 +342,11 @@ class ShareHandler(BaseHTTPRequestHandler):
     }
 
     def log_message(self, fmt, *args):
-        print(f"[{self.address_string()}] {fmt % args}")
+        REQUEST_LOGGER.info(
+            "[%s] %s",
+            self.address_string(),
+            fmt % args,
+        )
 
     # --------------------------------------------------------
     # Seguridad / sesión
@@ -1158,11 +1267,9 @@ def run_cli(args):
     print(f"Este equipo:  http://127.0.0.1:{args.port}/")
     print(f"Red local:    http://{host}:{args.port}/")
     print()
-    print(
-        f"Código de acceso: {current_access_code()} "
-        f"(cambia en {seconds_until_next_code()} s)"
-    )
     print("El código cambia cada 30 s; la sesión del navegador permanece activa.")
+    if REQUEST_LOG_PATH is not None:
+        print(f"Registro:      {REQUEST_LOG_PATH}")
     print()
     print("Funciones: subir, descargar, crear carpetas, mover, copiar, renombrar y eliminar.")
     print("Uso recomendado: redes locales de confianza. No expongas este puerto a Internet.")
@@ -1180,10 +1287,13 @@ def run_cli(args):
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nServidor detenido.")
+        pass
     finally:
         otp_stop.set()
+        otp_thread.join(timeout=1)
         server.server_close()
+
+    print("Servidor detenido.")
 
 
 def run_web_gui(args):
@@ -1910,6 +2020,12 @@ def build_parser():
         action="store_true",
         help="Forzar el panel de control web local",
     )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Mostrar también las peticiones HTTP en la consola",
+    )
 
     return parser
 
@@ -1917,6 +2033,12 @@ def build_parser():
 def main():
     parser = build_parser()
     args = parser.parse_args()
+
+    try:
+        configure_request_logging(args.verbose)
+    except OSError as exc:
+        print(f"No se pudo crear el registro de peticiones: {exc}")
+        return 1
 
     if args.web_gui:
         return run_web_gui(args)
