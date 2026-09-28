@@ -330,7 +330,7 @@ def is_same_or_child(path: Path, possible_parent: Path) -> bool:
 
 
 class ShareHandler(BaseHTTPRequestHandler):
-    server_version = "SimpleShare/2.5"
+    server_version = "SimpleShare/2.6"
 
     POST_ROUTES = {
         "/api/upload": "handle_upload",
@@ -1258,7 +1258,7 @@ def run_cli(args):
     host = display_host(args.bind)
 
     print()
-    print("Simple Share 2.5")
+    print("Simple Share 2.6")
     print("================")
     print(f"Carpeta:      {ROOT}")
     print(f"Puerto:       {args.port}")
@@ -1598,7 +1598,7 @@ setInterval(status,500);
     control_url = f"http://127.0.0.1:{control_port}/"
 
     print()
-    print("Simple Share 2.5 · Panel web")
+    print("Simple Share 2.6 · Panel web")
     print("============================")
     print(f"Panel local:  {control_url}")
     print(f"Carpeta:      {ROOT}")
