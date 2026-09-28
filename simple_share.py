@@ -373,7 +373,11 @@ class ConsoleDashboard:
         sys.stdout.flush()
         self.rendered_lines = 0
 
-    def _render_full_unlocked(self, size: tuple[int, int] | None = None):
+    def _render_full_unlocked(
+        self,
+        size: tuple[int, int] | None = None,
+        clear_screen: bool = False,
+    ):
         if sys.stdout is None:
             return
 
@@ -381,7 +385,15 @@ class ConsoleDashboard:
         lines = self._lines(size)
 
         if self.dynamic:
-            self._erase_unlocked()
+            if clear_screen:
+                # Al cambiar el ancho, el terminal puede haber refluido las
+                # líneas anteriores. Limpiar la pantalla evita depender de
+                # cuántas filas visuales ocupaban antes del resize.
+                sys.stdout.write("\033[2J\033[H")
+                self.rendered_lines = 0
+            else:
+                self._erase_unlocked()
+
             sys.stdout.write("\n".join(lines))
             sys.stdout.flush()
             self.rendered_lines = len(lines)
@@ -404,9 +416,9 @@ class ConsoleDashboard:
         with CONSOLE_LOCK:
             size = self._size()
 
-            # El ancho o el alto han cambiado: reconstruimos TODO.
+            # El ancho o el alto han cambiado: limpiamos y reconstruimos TODO.
             if size != self.last_size:
-                self._render_full_unlocked(size)
+                self._render_full_unlocked(size, clear_screen=True)
                 return
 
             width, _height = size
