@@ -32,7 +32,13 @@ Everything lives in a single Python file and uses only the Python standard libra
 
 No `pip install` is required.
 
-The optional desktop GUI uses **Tkinter**, which is included with standard Python installations on Windows and macOS. Some minimal Linux distributions package Tkinter separately; the CLI and web interface do not require it.
+The control interface is platform-aware:
+
+- **Windows:** `--gui` uses the native Tkinter window included with normal Python installations.
+- **Linux/macOS:** `--gui` opens a local browser-based control panel built entirely with the Python standard library.
+- **Any platform:** `--web-gui` forces the browser-based control panel.
+
+The web control panel requires no extra Python packages.
 
 ## Quick start
 
@@ -59,39 +65,47 @@ If no directory is specified, Simple Share automatically creates and uses:
 - Linux/macOS: `~/shared`
 - Windows: `C:\shared`
 
-### Optional desktop GUI
+### Control panel
 
-Simple Share also includes a small desktop control panel:
+Simple Share includes a four-button control panel:
 
 ```bash
 python3 simple_share.py --gui
 ```
 
-On Windows:
+The interface provides:
+
+- **Start** — starts the LAN server and creates a fresh session/OTP secret
+- **Stop** — stops the LAN server
+- **Open folder** — opens the shared directory
+- **Open browser** — opens the Simple Share LAN URL
+
+It also shows the server status, LAN URL, current 6-digit OTP, and the countdown until the next code.
+
+On **Windows**, `--gui` uses Tkinter:
 
 ```powershell
 python simple_share.py --gui
 ```
 
-The GUI provides four controls:
-
-- **Start** — starts the HTTP server and generates a fresh session/OTP secret
-- **Stop** — stops the server
-- **Open folder** — opens the shared directory in the operating-system file manager
-- **Open browser** — opens the local Simple Share URL
-
-It also shows the server status, LAN URL, current 6-digit OTP, and the countdown until the next code.
-
-On Windows, the GUI can be launched without a console window with:
+It can also be launched without a console window:
 
 ```powershell
 pythonw.exe simple_share.py --gui
 ```
 
+On **Linux and macOS**, `--gui` opens the zero-dependency control panel in the default browser. The control panel itself listens only on `127.0.0.1`; the file-sharing server still listens on the configured LAN address when you press **Start**.
+
+To force the browser control panel on any platform:
+
+```bash
+python3 simple_share.py --web-gui
+```
+
 At startup, the terminal prints the local URLs and a temporary 6-digit pairing code that rotates every 30 seconds:
 
 ```text
-Simple Share 2.3
+Simple Share 2.5
 ================
 Carpeta:      /home/user/shared
 Puerto:       8000
@@ -125,7 +139,7 @@ The directory is created automatically if it does not exist.
 
 ```text
 usage: simple_share.py [-h] [-p PORT] [-b BIND]
-                       [--max-upload-mb MAX_UPLOAD_MB] [--gui]
+                       [--max-upload-mb MAX_UPLOAD_MB] [--gui] [--web-gui]
                        [directory]
 ```
 
@@ -144,8 +158,11 @@ python3 simple_share.py --max-upload-mb 500
 # Listen only on the local machine
 python3 simple_share.py --bind 127.0.0.1
 
-# Open the desktop control panel
+# Open the platform-appropriate control panel
 python3 simple_share.py --gui
+
+# Force the zero-dependency browser control panel
+python3 simple_share.py --web-gui
 ```
 
 The default upload limit is **2048 MB per file**.
@@ -218,7 +235,8 @@ Simple Share is intentionally built without a web framework. It uses Python's st
 - `urllib.parse` for URL handling
 - `secrets`, `hmac`, and `hashlib` for rotating pairing codes and session tokens
 - `http.cookies` for the session cookie
-- vanilla HTML, CSS, and JavaScript for the interface
+- `webbrowser` for launching the local browser control panel
+- vanilla HTML, CSS, and JavaScript for the interfaces
 
 The server exposes a small internal API:
 
