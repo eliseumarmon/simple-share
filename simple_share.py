@@ -12,6 +12,8 @@ import secrets
 import shutil
 import socket
 import sys
+import threading
+import time
 import urllib.parse
 import uuid
 from http.cookies import SimpleCookie
@@ -23,7 +25,12 @@ ROOT: Path | None = None
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
 JSON_BODY_LIMIT = 64 * 1024
 ACCESS_TOKEN = ""
+ACCESS_CODE = ""
 COOKIE_NAME = "simple_share_auth"
+AUTH_WINDOW_SECONDS = 60
+AUTH_MAX_FAILURES = 5
+AUTH_FAILURES: dict[str, list[float]] = {}
+AUTH_LOCK = threading.Lock()
 
 
 # ============================================================
@@ -160,7 +167,7 @@ def is_same_or_child(path: Path, possible_parent: Path) -> bool:
 
 
 class ShareHandler(BaseHTTPRequestHandler):
-    server_version = "SimpleShare/2.1"
+    server_version = "SimpleShare/2.2"
 
     POST_ROUTES = {
         "/api/upload": "handle_upload",
@@ -206,30 +213,121 @@ class ShareHandler(BaseHTTPRequestHandler):
         morsel = cookie.get(COOKIE_NAME)
         return morsel is not None and self.token_matches(morsel.value)
 
-    def try_bootstrap_session(self, parsed) -> bool:
-        params = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
-        supplied = params.get("token", [None])[0]
+    def _auth_client_key(self) -> str:
+        return self.client_address[0]
 
-        if supplied is None:
-            return False
+    def _auth_rate_limited(self) -> bool:
+        now = time.monotonic()
+        key = self._auth_client_key()
 
-        if not self.token_matches(supplied):
-            self.send_auth_required()
-            return True
+        with AUTH_LOCK:
+            recent = [
+                stamp
+                for stamp in AUTH_FAILURES.get(key, [])
+                if now - stamp < AUTH_WINDOW_SECONDS
+            ]
+            AUTH_FAILURES[key] = recent
+            return len(recent) >= AUTH_MAX_FAILURES
 
-        filtered = [
-            (key, value)
-            for key, values in params.items()
-            if key != "token"
-            for value in values
-        ]
-        clean_query = urllib.parse.urlencode(filtered)
-        location = parsed.path or "/"
-        if clean_query:
-            location += "?" + clean_query
+    def _record_auth_failure(self):
+        now = time.monotonic()
+        key = self._auth_client_key()
+
+        with AUTH_LOCK:
+            recent = [
+                stamp
+                for stamp in AUTH_FAILURES.get(key, [])
+                if now - stamp < AUTH_WINDOW_SECONDS
+            ]
+            recent.append(now)
+            AUTH_FAILURES[key] = recent
+
+    def _clear_auth_failures(self):
+        with AUTH_LOCK:
+            AUTH_FAILURES.pop(self._auth_client_key(), None)
+
+    def send_login_page(self, error: str = "", status: int = 200):
+        error_html = (
+            f'<div class="error">{html.escape(error)}</div>'
+            if error
+            else ""
+        )
+
+        body = (
+            '<!doctype html><html lang="es"><head><meta charset="utf-8">'
+            '<meta name="viewport" content="width=device-width,initial-scale=1">'
+            '<title>Simple Share</title><style>'
+            '*{box-sizing:border-box}body{margin:0;background:#111827;color:#e5e7eb;'
+            'font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;'
+            'display:grid;place-items:center;min-height:100vh;padding:24px}'
+            '.card{width:min(100%,420px);background:#1f2937;border:1px solid #374151;'
+            'border-radius:16px;padding:24px;box-shadow:0 18px 50px rgba(0,0,0,.25)}'
+            'h1{margin:0 0 8px;font-size:1.45rem}p{color:#9ca3af;line-height:1.5;margin:0 0 20px}'
+            'form{display:grid;gap:12px}input{width:100%;padding:14px 16px;border-radius:10px;'
+            'border:1px solid #4b5563;background:#111827;color:#f9fafb;font:inherit;'
+            'font-size:1.3rem;letter-spacing:.35em;text-align:center;outline:none}'
+            'input:focus{border-color:#3b82f6}button{padding:13px 16px;border:0;border-radius:10px;'
+            'background:#2563eb;color:white;font:inherit;font-weight:700;cursor:pointer}'
+            '.error{margin-bottom:14px;padding:10px 12px;border-radius:9px;background:#3f1d24;'
+            'color:#fecaca;font-size:.9rem}</style></head><body><main class="card">'
+            '<h1>Simple Share</h1>'
+            '<p>Introduce el código de 6 dígitos que aparece en la terminal del ordenador.</p>'
+            f'{error_html}'
+            '<form method="post" action="/auth">'
+            '<input type="text" name="code" inputmode="numeric" pattern="[0-9]{6}" '
+            'maxlength="6" autocomplete="one-time-code" autofocus required aria-label="Código de acceso">'
+            '<button type="submit">Entrar</button>'
+            '</form></main></body></html>'
+        ).encode("utf-8")
+
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.add_security_headers()
+        self.end_headers()
+        self.wfile.write(body)
+
+    def handle_auth(self):
+        if self._auth_rate_limited():
+            self.send_login_page(
+                "Demasiados intentos. Espera un minuto antes de volver a probar.",
+                status=429,
+            )
+            return
+
+        if not self.valid_origin():
+            self.send_login_page("Solicitud de acceso no válida.", status=403)
+            return
+
+        raw_length = self.headers.get("Content-Length", "0")
+        try:
+            length = int(raw_length)
+        except ValueError:
+            length = 0
+
+        if length <= 0 or length > 1024:
+            self.send_login_page("Solicitud de acceso no válida.", status=400)
+            return
+
+        try:
+            raw = self.rfile.read(length).decode("utf-8")
+        except UnicodeDecodeError:
+            self.send_login_page("Solicitud de acceso no válida.", status=400)
+            return
+
+        params = urllib.parse.parse_qs(raw, keep_blank_values=True)
+        supplied = params.get("code", [""])[0].strip()
+
+        if not hmac.compare_digest(supplied, ACCESS_CODE):
+            self._record_auth_failure()
+            self.send_login_page("Código incorrecto.", status=401)
+            return
+
+        self._clear_auth_failures()
 
         self.send_response(303)
-        self.send_header("Location", location)
+        self.send_header("Location", "/")
         self.send_header(
             "Set-Cookie",
             f"{COOKIE_NAME}={ACCESS_TOKEN}; Path=/; HttpOnly; SameSite=Strict",
@@ -237,36 +335,16 @@ class ShareHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.add_security_headers()
         self.end_headers()
-        return True
 
     def send_auth_required(self, api: bool = False):
         if api:
             self.api_error(
                 401,
-                "Sesión no autorizada. Abre de nuevo el enlace mostrado en la terminal.",
+                "Sesión no autorizada. Vuelve a abrir Simple Share e introduce el código de acceso.",
             )
             return
 
-        body = (
-            '<!doctype html><html lang="es"><head><meta charset="utf-8">'
-            '<meta name="viewport" content="width=device-width,initial-scale=1">'
-            '<title>Simple Share</title><style>'
-            'body{margin:0;background:#111827;color:#e5e7eb;font-family:system-ui,-apple-system,'
-            'BlinkMacSystemFont,"Segoe UI",sans-serif;display:grid;place-items:center;min-height:100vh;'
-            'padding:24px;box-sizing:border-box}.card{max-width:560px;background:#1f2937;border:1px solid '
-            '#374151;border-radius:14px;padding:24px}h1{margin-top:0;font-size:1.35rem}p{color:#cbd5e1;'
-            'line-height:1.5;margin-bottom:0}</style></head><body><div class="card">'
-            '<h1>Acceso no autorizado</h1><p>Abre en este dispositivo la URL completa que Simple Share '
-            'muestra en la terminal. El enlace contiene un token temporal que cambia cada vez que se inicia '
-            'el servidor.</p></div></body></html>'
-        ).encode("utf-8")
-        self.send_response(401)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.add_security_headers()
-        self.end_headers()
-        self.wfile.write(body)
+        self.send_login_page()
 
     def valid_origin(self) -> bool:
         origin = self.headers.get("Origin")
@@ -286,9 +364,6 @@ class ShareHandler(BaseHTTPRequestHandler):
             self.send_response(204)
             self.add_security_headers()
             self.end_headers()
-            return
-
-        if self.try_bootstrap_session(parsed):
             return
 
         if not self.is_authenticated():
@@ -316,6 +391,10 @@ class ShareHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         route = urllib.parse.urlsplit(self.path).path
+
+        if route == "/auth":
+            self.handle_auth()
+            return
 
         if not self.is_authenticated():
             self.send_auth_required(api=True)
@@ -994,8 +1073,8 @@ def main():
         sys.exit(1)
 
     MAX_UPLOAD_BYTES = args.max_upload_mb * 1024 * 1024
-    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-    ACCESS_TOKEN = "".join(secrets.choice(alphabet) for _ in range(12))
+    ACCESS_TOKEN = secrets.token_urlsafe(32)
+    ACCESS_CODE = f"{secrets.randbelow(1_000_000):06d}"
 
     try:
         server = ShareServer((args.bind, args.port), ShareHandler)
@@ -1006,17 +1085,17 @@ def main():
     ip = local_ip()
 
     print()
-    print("Simple Share 2.1")
+    print("Simple Share 2.2")
     print("================")
     print(f"Carpeta:      {ROOT}")
     print(f"Puerto:       {args.port}")
     print()
-    print("Abre uno de estos enlaces completos para iniciar una sesión:")
-    print(f"Este equipo:  http://127.0.0.1:{args.port}/?token={ACCESS_TOKEN}")
-    print(f"Red local:    http://{ip}:{args.port}/?token={ACCESS_TOKEN}")
+    print("Abre Simple Share desde el navegador:")
+    print(f"Este equipo:  http://127.0.0.1:{args.port}/")
+    print(f"Red local:    http://{ip}:{args.port}/")
     print()
-    print(f"Token temporal: {ACCESS_TOKEN}")
-    print("El token cambia cada vez que se inicia el servidor.")
+    print(f"Código de acceso: {ACCESS_CODE}")
+    print("El código y la sesión cambian cada vez que se inicia el servidor.")
     print()
     print("Funciones: subir, descargar, crear carpetas, mover, copiar, renombrar y eliminar.")
     print("Uso recomendado: redes locales de confianza. No expongas este puerto a Internet.")
