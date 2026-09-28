@@ -101,7 +101,7 @@ python3 simple_share.py --web-gui
 At startup, the terminal prints the local URLs and a temporary 6-digit pairing code that rotates every 30 seconds:
 
 ```text
-Simple Share 2.13
+Simple Share 2.14
 ================
 Carpeta:      /home/user/shared
 Puerto:       8000
@@ -186,7 +186,7 @@ By default, request lines are **not printed to the terminal**, keeping the CLI c
 
 The live OTP line also adapts to the available terminal width. It automatically switches between full and compact forms such as `Código de acceso LAN: 123456 · cambia en 17 s`, `OTP 123456 · 17s`, or simply `123456` on very narrow terminals, avoiding line wrapping while the countdown refreshes.
 
-The CLI summary adapts to the current terminal width. Long filesystem paths are shortened in the middle with an ellipsis so the layout stays intact. At widths below 60 columns, Simple Share automatically switches from the bordered two-column table to a compact one-line-per-field layout, which remains usable down to very narrow terminals such as 33 columns.
+The CLI is rendered as a responsive dashboard. Its title is integrated into the table border and adapts with the available width. Paths and URLs expand again when the terminal becomes wider and are shortened in the middle only when necessary. When either terminal width or height changes, the dashboard is rebuilt from the current dimensions instead of relying on fixed breakpoints. On very short terminals it progressively hides lower-priority detail while keeping the OTP visible.
 
 On terminals that support OSC 8 hyperlinks, the **shared folder path** is clickable and opens the folder. The **log path** links to the containing `simple_share_logs` directory. Some terminals require Ctrl+click or Cmd+click.
 
@@ -202,7 +202,7 @@ or:
 python3 simple_share.py -v
 ```
 
-When verbose mode is enabled, request lines are printed without breaking the live OTP status line.
+When verbose mode is enabled, request lines are printed above the responsive dashboard and the dashboard is then restored.
 
 ## Security model
 
