@@ -57,10 +57,10 @@ If no directory is specified, Simple Share automatically creates and uses:
 - Linux/macOS: `~/shared`
 - Windows: `C:\shared`
 
-At startup, the terminal prints the local URLs and a temporary 6-digit pairing code:
+At startup, the terminal prints the local URLs and a temporary 6-digit pairing code that rotates every 30 seconds:
 
 ```text
-Simple Share 2.2
+Simple Share 2.3
 ================
 Carpeta:      /home/user/shared
 Puerto:       8000
@@ -69,10 +69,10 @@ Abre Simple Share desde el navegador:
 Este equipo:  http://127.0.0.1:8000/
 Red local:    http://192.168.1.50:8000/
 
-Código de acceso: 482731
+Código de acceso: 482731 (cambia en 17 s)
 ```
 
-Open the **Red local** URL from the other device, enter the 6-digit code once, and Simple Share creates a browser session. You never need to type a long token into the URL.
+Open the **Red local** URL from the other device and enter the current 6-digit code. The pairing code changes every 30 seconds, but after a successful login the browser session stays active until the server restarts. You never need to type a long token into the URL.
 
 ## Custom shared folder
 
@@ -124,9 +124,9 @@ The server includes several protections while keeping the project dependency-fre
 
 ### Temporary pairing code and session token
 
-Every time the server starts, Simple Share generates a **6-digit pairing code** shown in the terminal and a separate **cryptographically strong random session token** used internally by the browser cookie.
+Every time the server starts, Simple Share generates a cryptographically random secret used to derive a **6-digit time-based pairing code**. The visible code rotates every 30 seconds. A separate **cryptographically strong random session token** is used internally by the browser cookie.
 
-Open the normal LAN URL, enter the short pairing code once, and the browser receives the session cookie. The long session token is never shown in the URL.
+Open the normal LAN URL and enter the current short pairing code. Simple Share accepts the current 30-second interval and the immediately previous interval so a code does not fail just because it rotated while you were typing. After successful pairing, the browser receives the session cookie and does not need to re-enter a code every 30 seconds. The long session token is never shown in the URL.
 
 The cookie uses:
 
@@ -136,7 +136,7 @@ SameSite=Strict
 Path=/
 ```
 
-Failed pairing attempts are rate-limited per client. Restarting the server invalidates both the previous pairing code and existing sessions.
+Failed pairing attempts are rate-limited per client. Restarting the server creates a new pairing secret and invalidates all existing sessions.
 
 ### Origin validation
 
@@ -182,7 +182,7 @@ Simple Share is intentionally built without a web framework. It uses Python's st
 - `pathlib` for filesystem paths
 - `shutil` for file operations
 - `urllib.parse` for URL handling
-- `secrets` for pairing codes and session tokens
+- `secrets`, `hmac`, and `hashlib` for rotating pairing codes and session tokens
 - `http.cookies` for the session cookie
 - vanilla HTML, CSS, and JavaScript for the interface
 
