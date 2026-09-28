@@ -204,9 +204,9 @@ def print_console_grid(rows):
     # automático al escribir exactamente en ella, aunque después venga \n.
     safe_width = max(1, terminal_width - 1)
 
-    # En terminales muy estrechos una tabla de dos columnas deja de ser útil.
-    # Cambiamos a una lista compacta que mantiene cada dato en una sola línea.
-    if safe_width < 40:
+    # Empíricamente, por debajo de 60 columnas la tabla con bordes empieza
+    # a hacer wrap en algunos terminales. A 59 o menos usamos el modo compacto.
+    if terminal_width < 60:
         for label, value, target in normalized:
             prefix = f"{label}: "
             available = max(1, safe_width - len(prefix))
@@ -472,7 +472,7 @@ def is_same_or_child(path: Path, possible_parent: Path) -> bool:
 
 
 class ShareHandler(BaseHTTPRequestHandler):
-    server_version = "SimpleShare/2.12"
+    server_version = "SimpleShare/2.13"
 
     POST_ROUTES = {
         "/api/upload": "handle_upload",
@@ -1404,7 +1404,7 @@ def run_cli(args):
     host = display_host(args.bind)
 
     print()
-    print("Simple Share 2.12")
+    print("Simple Share 2.13")
     print("================")
     print_console_grid(
         [
@@ -1750,7 +1750,7 @@ setInterval(status,500);
     control_url = f"http://127.0.0.1:{control_port}/"
 
     print()
-    print("Simple Share 2.12 · Panel web")
+    print("Simple Share 2.13 · Panel web")
     print("============================")
     print(f"Panel local:  {control_url}")
     print(f"Carpeta:      {ROOT}")
