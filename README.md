@@ -1,0 +1,240 @@
+# Simple Share
+
+A small, zero-dependency Python file server for sharing files across a trusted local network from any modern browser.
+
+Simple Share turns a folder on your computer into a lightweight web file manager. Open the temporary URL shown in the terminal from your phone, tablet, or another computer and you can upload, download, organize, move, copy, rename, and delete files without installing an app on the client device.
+
+Everything lives in a single Python file and uses only the Python standard library.
+
+## Features
+
+- Upload one or multiple files from the browser
+- Download files
+- Browse nested folders
+- Create folders
+- Rename files and folders
+- Move files and folders
+- Copy files and folders
+- Delete files and folders
+- Multi-select files and folders for batch move, copy, and delete
+- Automatic collision-safe names such as `photo (1).jpg`
+- Responsive interface designed for desktop and mobile browsers
+- Inline SVG icons with no external assets or CDN
+- Threaded HTTP server
+- Configurable port, bind address, shared folder, and upload size limit
+- Zero third-party Python dependencies
+
+## Requirements
+
+- Python 3.10 or newer
+- Windows, Linux, or macOS
+- Both devices must be able to reach each other over the local network
+
+No `pip install` is required.
+
+## Quick start
+
+Clone the repository or download `simple_share.py`, then run:
+
+```bash
+python3 simple_share.py
+```
+
+On Windows, depending on your Python installation:
+
+```powershell
+python simple_share.py
+```
+
+or:
+
+```powershell
+py simple_share.py
+```
+
+If no directory is specified, Simple Share automatically creates and uses:
+
+- Linux/macOS: `~/shared`
+- Windows: `C:\shared`
+
+At startup, the terminal prints local URLs containing a temporary access token:
+
+```text
+Simple Share 2.1
+================
+Carpeta:      /home/user/shared
+Puerto:       8000
+
+Abre uno de estos enlaces completos para iniciar una sesión:
+Este equipo:  http://127.0.0.1:8000/?token=XXXXXXXXXXXX
+Red local:    http://192.168.1.50:8000/?token=XXXXXXXXXXXX
+```
+
+Open the **Red local** URL from the other device. After the first request, the token is exchanged for a session cookie and removed from the address bar.
+
+## Custom shared folder
+
+Pass a directory as the first argument:
+
+```bash
+python3 simple_share.py ~/Downloads/share
+```
+
+Windows example:
+
+```powershell
+python simple_share.py D:\Shared
+```
+
+The directory is created automatically if it does not exist.
+
+## Options
+
+```text
+usage: simple_share.py [-h] [-p PORT] [-b BIND]
+                       [--max-upload-mb MAX_UPLOAD_MB]
+                       [directory]
+```
+
+Examples:
+
+```bash
+# Use port 8080
+python3 simple_share.py -p 8080
+
+# Share a custom directory
+python3 simple_share.py ~/Downloads/share
+
+# Limit each upload to 500 MB
+python3 simple_share.py --max-upload-mb 500
+
+# Listen only on the local machine
+python3 simple_share.py --bind 127.0.0.1
+```
+
+The default upload limit is **2048 MB per file**.
+
+## Security model
+
+Simple Share is intended for **trusted local networks**. It is not designed to be exposed directly to the public Internet.
+
+The server includes several protections while keeping the project dependency-free:
+
+### Temporary access token
+
+A cryptographically random token is generated every time the server starts. The initial URL contains the token, which is then exchanged for an HTTP-only session cookie.
+
+The cookie uses:
+
+```text
+HttpOnly
+SameSite=Strict
+Path=/
+```
+
+Restarting the server invalidates the previous session because a new token is generated.
+
+### Origin validation
+
+All operations that modify data require requests to originate from the same Simple Share origin. Cross-origin write requests are rejected.
+
+This helps protect the local service against browser-based cross-site request attacks.
+
+### Path containment
+
+Every requested path is resolved and checked to ensure it remains inside the configured shared directory. Attempts to escape the shared folder through paths such as `../` are rejected.
+
+Symbolic links are not exposed in the browser interface.
+
+### Browser security headers
+
+Responses include defensive headers such as:
+
+- `Content-Security-Policy`
+- `X-Content-Type-Options: nosniff`
+- `X-Frame-Options: DENY`
+- `Referrer-Policy: no-referrer`
+- `Cache-Control: no-store` where appropriate
+
+### Important limitations
+
+The connection uses plain HTTP. Anyone capable of intercepting traffic on the local network may be able to observe transferred data. Use Simple Share only on networks you trust.
+
+Do **not**:
+
+- forward the Simple Share port from your router to the Internet
+- expose it through a public tunnel without adding appropriate HTTPS and authentication
+- run it on an untrusted public Wi-Fi unless you understand the network exposure
+- place sensitive files in the shared directory unless you intend to make them available through Simple Share
+
+Deletion is permanent; files are not moved to the operating system recycle bin or trash.
+
+## How it works
+
+Simple Share is intentionally built without a web framework. It uses Python's standard library:
+
+- `http.server` for HTTP serving
+- `ThreadingHTTPServer` for concurrent requests
+- `pathlib` for filesystem paths
+- `shutil` for file operations
+- `urllib.parse` for URL handling
+- `secrets` for temporary access tokens
+- `http.cookies` for the session cookie
+- vanilla HTML, CSS, and JavaScript for the interface
+
+The server exposes a small internal API:
+
+```text
+GET  /api/directories
+POST /api/upload
+POST /api/mkdir
+POST /api/move
+POST /api/copy
+POST /api/rename
+POST /api/delete
+```
+
+The web interface is embedded directly in `simple_share.py`, so the whole application remains portable as a single file.
+
+## Design goals
+
+Simple Share intentionally prioritizes:
+
+1. **No dependencies** — copy one Python file and run it.
+2. **No client app** — a browser is enough.
+3. **Cross-platform use** — the same script works on Windows, Linux, and macOS.
+4. **Useful defaults** — running the script with no arguments should be enough for normal use.
+5. **Local-first operation** — no cloud service, account, database, or external API is required.
+6. **A small codebase** — enough functionality to be useful without turning the project into a full file-management platform.
+
+## Network/firewall notes
+
+The default bind address is:
+
+```text
+0.0.0.0:8000
+```
+
+This allows other devices that can reach your computer over the network to connect to Simple Share. Your operating system firewall may ask whether Python should accept incoming connections.
+
+If you only want to access Simple Share from the same computer, use:
+
+```bash
+python3 simple_share.py --bind 127.0.0.1
+```
+
+In a typical home network behind a NAT router, the service is not directly reachable from the Internet unless the port is explicitly forwarded or exposed through another mechanism. Devices on the same LAN may still be able to reach it, which is why the temporary access token is enabled by default.
+
+## Current scope
+
+Simple Share deliberately does not include:
+
+- user accounts
+- databases
+- cloud storage
+- public Internet hosting
+- TLS certificate management
+- permanent authentication credentials
+- external JavaScript or CSS dependencies
+
+Those are outside the project's local, zero-dependency goal.
