@@ -57,20 +57,22 @@ If no directory is specified, Simple Share automatically creates and uses:
 - Linux/macOS: `~/shared`
 - Windows: `C:\shared`
 
-At startup, the terminal prints local URLs containing a temporary access token:
+At startup, the terminal prints the local URLs and a temporary 6-digit pairing code:
 
 ```text
-Simple Share 2.1
+Simple Share 2.2
 ================
 Carpeta:      /home/user/shared
 Puerto:       8000
 
-Abre uno de estos enlaces completos para iniciar una sesión:
-Este equipo:  http://127.0.0.1:8000/?token=XXXXXXXXXXXX
-Red local:    http://192.168.1.50:8000/?token=XXXXXXXXXXXX
+Abre Simple Share desde el navegador:
+Este equipo:  http://127.0.0.1:8000/
+Red local:    http://192.168.1.50:8000/
+
+Código de acceso: 482731
 ```
 
-Open the **Red local** URL from the other device. After the first request, the token is exchanged for a session cookie and removed from the address bar.
+Open the **Red local** URL from the other device, enter the 6-digit code once, and Simple Share creates a browser session. You never need to type a long token into the URL.
 
 ## Custom shared folder
 
@@ -120,9 +122,11 @@ Simple Share is intended for **trusted local networks**. It is not designed to b
 
 The server includes several protections while keeping the project dependency-free:
 
-### Temporary access token
+### Temporary pairing code and session token
 
-A cryptographically random token is generated every time the server starts. The initial URL contains the token, which is then exchanged for an HTTP-only session cookie.
+Every time the server starts, Simple Share generates a **6-digit pairing code** shown in the terminal and a separate **cryptographically strong random session token** used internally by the browser cookie.
+
+Open the normal LAN URL, enter the short pairing code once, and the browser receives the session cookie. The long session token is never shown in the URL.
 
 The cookie uses:
 
@@ -132,7 +136,7 @@ SameSite=Strict
 Path=/
 ```
 
-Restarting the server invalidates the previous session because a new token is generated.
+Failed pairing attempts are rate-limited per client. Restarting the server invalidates both the previous pairing code and existing sessions.
 
 ### Origin validation
 
@@ -178,7 +182,7 @@ Simple Share is intentionally built without a web framework. It uses Python's st
 - `pathlib` for filesystem paths
 - `shutil` for file operations
 - `urllib.parse` for URL handling
-- `secrets` for temporary access tokens
+- `secrets` for pairing codes and session tokens
 - `http.cookies` for the session cookie
 - vanilla HTML, CSS, and JavaScript for the interface
 
@@ -223,7 +227,7 @@ If you only want to access Simple Share from the same computer, use:
 python3 simple_share.py --bind 127.0.0.1
 ```
 
-In a typical home network behind a NAT router, the service is not directly reachable from the Internet unless the port is explicitly forwarded or exposed through another mechanism. Devices on the same LAN may still be able to reach it, which is why the temporary access token is enabled by default.
+In a typical home network behind a NAT router, the service is not directly reachable from the Internet unless the port is explicitly forwarded or exposed through another mechanism. Devices on the same LAN may still be able to reach it, which is why pairing-code authentication is enabled by default.
 
 ## Current scope
 
