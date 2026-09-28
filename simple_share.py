@@ -185,6 +185,7 @@ def print_console_grid(rows):
     Imprime una tabla compacta adaptada al ancho de terminal.
 
     Cada fila puede ser (label, value) o (label, value, hyperlink_target).
+    Tanto la columna de etiquetas como la de valores pueden encogerse.
     """
     normalized = []
     for row in rows:
@@ -196,53 +197,82 @@ def print_console_grid(rows):
 
         normalized.append((str(label), str(value), target))
 
-    label_width = max(len(label) for label, _, _ in normalized)
+    if not normalized:
+        return
 
     terminal_width = shutil.get_terminal_size(fallback=(100, 24)).columns
 
     # Reservamos siempre la última columna. Algunos terminales hacen wrap
-    # automático al escribir exactamente en ella, aunque después venga \n.
+    # automático al escribir exactamente en ella.
     safe_width = max(1, terminal_width - 1)
-
-    # Empíricamente, por debajo de 60 columnas la tabla con bordes empieza
-    # a hacer wrap en algunos terminales. A 59 o menos usamos el modo compacto.
-    if terminal_width < 60:
-        for label, value, target in normalized:
-            prefix = f"{label}: "
-            available = max(1, safe_width - len(prefix))
-            visible = shorten_middle(value, available)
-            linked = console_hyperlink(visible, target)
-
-            if len(prefix) >= safe_width:
-                print(shorten_middle(label, safe_width))
-            else:
-                print(f"{prefix}{linked}")
-        return
-
     table_width = min(safe_width, 120)
 
-    # Bordes + espacios + separador ocupan 7 columnas.
-    max_value_width = max(1, table_width - label_width - 7)
+    # Una tabla de dos columnas necesita 7 caracteres estructurales:
+    # │ + espacios interiores + │ + espacios interiores + │.
+    # Con anchos absurdamente pequeños degradamos a una sola línea por fila.
+    if table_width < 9:
+        for label, value, target in normalized:
+            combined = f"{label}: {value}"
+            visible = shorten_middle(combined, safe_width)
+            print(console_hyperlink(visible, target))
+        return
+
+    desired_label_width = max(len(label) for label, _, _ in normalized)
+    desired_value_width = max(len(value) for _, value, _ in normalized)
+    content_budget = table_width - 7
+
+    # Si todo cabe, conservamos el tamaño natural. Si no, repartimos el ancho
+    # proporcionalmente: también se encogen etiquetas, URLs e IPs.
+    desired_total = desired_label_width + desired_value_width
+    if desired_total <= content_budget:
+        label_width = desired_label_width
+        value_width = desired_value_width
+    else:
+        label_width = max(
+            1,
+            round(content_budget * desired_label_width / max(1, desired_total)),
+        )
+        value_width = max(1, content_budget - label_width)
+
+        # Si una columna ya cabe completa, cedemos el espacio sobrante a la otra.
+        if label_width > desired_label_width:
+            extra = label_width - desired_label_width
+            label_width = desired_label_width
+            value_width += extra
+
+        if value_width > desired_value_width:
+            extra = value_width - desired_value_width
+            value_width = desired_value_width
+            label_width += extra
+
+        # Protege el presupuesto tras los reajustes.
+        label_width = max(1, min(label_width, content_budget - 1))
+        value_width = max(1, content_budget - label_width)
+
+    visible_labels = [
+        shorten_middle(label, label_width)
+        for label, _, _ in normalized
+    ]
     visible_values = [
-        shorten_middle(value, max_value_width)
+        shorten_middle(value, value_width)
         for _, value, _ in normalized
     ]
-    value_width = max(len(value) for value in visible_values)
 
     top = f"┌{'─' * (label_width + 2)}┬{'─' * (value_width + 2)}┐"
     middle = f"├{'─' * (label_width + 2)}┼{'─' * (value_width + 2)}┤"
     bottom = f"└{'─' * (label_width + 2)}┴{'─' * (value_width + 2)}┘"
 
     print(top)
-    for index, ((label, _value, target), visible) in enumerate(
-        zip(normalized, visible_values)
+    for index, ((_, _value, target), label, value) in enumerate(
+        zip(normalized, visible_labels, visible_values)
     ):
-        linked = console_hyperlink(visible, target)
-        padding = " " * (value_width - len(visible))
+        linked = console_hyperlink(value, target)
+        label_padding = " " * (label_width - len(label))
+        value_padding = " " * (value_width - len(value))
 
         print(
-            f"│ {label.ljust(label_width)} │ "
-            f"{linked}{padding} │"
+            f"│ {label}{label_padding} │ "
+            f"{linked}{value_padding} │"
         )
         if index != len(normalized) - 1:
             print(middle)
