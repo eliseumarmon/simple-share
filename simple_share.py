@@ -115,25 +115,79 @@ class StatusAwareConsoleHandler(logging.StreamHandler):
             self.handleError(record)
 
 
-def print_console_grid(rows):
-    """Imprime una tabla compacta con la información principal del servidor."""
-    labels = [str(label) for label, _ in rows]
-    values = [str(value) for _, value in rows]
+def shorten_middle(value: str, max_width: int) -> str:
+    """Acorta texto largo conservando el principio y el final."""
+    if len(value) <= max_width:
+        return value
 
-    label_width = max(len(label) for label in labels)
-    value_width = max(len(value) for value in values)
+    if max_width <= 3:
+        return value[:max_width]
+
+    available = max_width - 1
+    left = (available + 1) // 2
+    right = available - left
+    return f"{value[:left]}…{value[-right:] if right else ''}"
+
+
+def supports_console_hyperlinks() -> bool:
+    if sys.stdout is None or not sys.stdout.isatty():
+        return False
+    return os.environ.get("TERM", "").lower() != "dumb"
+
+
+def console_hyperlink(text: str, target: str | None) -> str:
+    """Crea un enlace OSC 8 cuando el terminal lo permite."""
+    if not target or not supports_console_hyperlinks():
+        return text
+
+    return f"\033]8;;{target}\033\\{text}\033]8;;\033\\"
+
+
+def print_console_grid(rows):
+    """
+    Imprime una tabla compacta adaptada al ancho de terminal.
+
+    Cada fila puede ser (label, value) o (label, value, hyperlink_target).
+    """
+    normalized = []
+    for row in rows:
+        if len(row) == 2:
+            label, value = row
+            target = None
+        else:
+            label, value, target = row
+
+        normalized.append((str(label), str(value), target))
+
+    label_width = max(len(label) for label, _, _ in normalized)
+
+    terminal_width = shutil.get_terminal_size(fallback=(100, 24)).columns
+    table_width = max(36, min(terminal_width, 120))
+
+    # Bordes + espacios + separador ocupan 7 columnas.
+    max_value_width = max(12, table_width - label_width - 7)
+    visible_values = [
+        shorten_middle(value, max_value_width)
+        for _, value, _ in normalized
+    ]
+    value_width = max(len(value) for value in visible_values)
 
     top = f"┌{'─' * (label_width + 2)}┬{'─' * (value_width + 2)}┐"
     middle = f"├{'─' * (label_width + 2)}┼{'─' * (value_width + 2)}┤"
     bottom = f"└{'─' * (label_width + 2)}┴{'─' * (value_width + 2)}┘"
 
     print(top)
-    for index, (label, value) in enumerate(zip(labels, values)):
+    for index, ((label, _value, target), visible) in enumerate(
+        zip(normalized, visible_values)
+    ):
+        linked = console_hyperlink(visible, target)
+        padding = " " * (value_width - len(visible))
+
         print(
             f"│ {label.ljust(label_width)} │ "
-            f"{value.ljust(value_width)} │"
+            f"{linked}{padding} │"
         )
-        if index != len(rows) - 1:
+        if index != len(normalized) - 1:
             print(middle)
     print(bottom)
 
@@ -361,7 +415,7 @@ def is_same_or_child(path: Path, possible_parent: Path) -> bool:
 
 
 class ShareHandler(BaseHTTPRequestHandler):
-    server_version = "SimpleShare/2.8"
+    server_version = "SimpleShare/2.9"
 
     POST_ROUTES = {
         "/api/upload": "handle_upload",
@@ -1293,15 +1347,21 @@ def run_cli(args):
     host = display_host(args.bind)
 
     print()
-    print("Simple Share 2.8")
+    print("Simple Share 2.9")
     print("================")
     print_console_grid(
         [
-            ("Carpeta", ROOT),
+            ("Carpeta", ROOT, ROOT.as_uri()),
             ("Puerto", args.port),
             ("Localhost", f"http://127.0.0.1:{args.port}/"),
             ("Red local", f"http://{host}:{args.port}/"),
-            ("Registro", REQUEST_LOG_PATH or "No disponible"),
+            (
+                "Registro",
+                REQUEST_LOG_PATH or "No disponible",
+                REQUEST_LOG_PATH.parent.as_uri()
+                if REQUEST_LOG_PATH is not None
+                else None,
+            ),
         ]
     )
     print()
@@ -1633,7 +1693,7 @@ setInterval(status,500);
     control_url = f"http://127.0.0.1:{control_port}/"
 
     print()
-    print("Simple Share 2.8 · Panel web")
+    print("Simple Share 2.9 · Panel web")
     print("============================")
     print(f"Panel local:  {control_url}")
     print(f"Carpeta:      {ROOT}")
