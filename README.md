@@ -101,7 +101,7 @@ python3 simple_share.py --web-gui
 At startup, the terminal prints the local URLs and a temporary 6-digit pairing code that rotates every 30 seconds:
 
 ```text
-Simple Share 2.9
+Simple Share 2.10
 ================
 Carpeta:      /home/user/shared
 Puerto:       8000
@@ -183,6 +183,8 @@ simple-share/
 A single log file is reused for each calendar day and new entries are appended to it.
 
 By default, request lines are **not printed to the terminal**, keeping the CLI clean while the OTP refreshes in place on a single line.
+
+The live OTP line also adapts to the available terminal width. It automatically switches between full and compact forms such as `Código de acceso LAN: 123456 · cambia en 17 s`, `OTP 123456 · 17s`, or simply `123456` on very narrow terminals, avoiding line wrapping while the countdown refreshes.
 
 The CLI summary table adapts to the current terminal width. Long filesystem paths are shortened in the middle with an ellipsis so the table border stays intact.
 
