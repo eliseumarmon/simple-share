@@ -5,6 +5,7 @@
 import argparse
 import html
 import hmac
+import ipaddress
 import hashlib
 import json
 import logging
@@ -57,7 +58,7 @@ def script_directory() -> Path:
 def current_console_status() -> str:
     code = current_access_code()
     return (
-        f"Código de acceso: {code} · "
+        f"Código de acceso LAN: {code} · "
         f"cambia en {seconds_until_next_code():02d} s"
     )
 
@@ -112,6 +113,29 @@ class StatusAwareConsoleHandler(logging.StreamHandler):
                 _draw_console_status_unlocked()
         except Exception:
             self.handleError(record)
+
+
+def print_console_grid(rows):
+    """Imprime una tabla compacta con la información principal del servidor."""
+    labels = [str(label) for label, _ in rows]
+    values = [str(value) for _, value in rows]
+
+    label_width = max(len(label) for label in labels)
+    value_width = max(len(value) for value in values)
+
+    top = f"┌{'─' * (label_width + 2)}┬{'─' * (value_width + 2)}┐"
+    middle = f"├{'─' * (label_width + 2)}┼{'─' * (value_width + 2)}┤"
+    bottom = f"└{'─' * (label_width + 2)}┴{'─' * (value_width + 2)}┘"
+
+    print(top)
+    for index, (label, value) in enumerate(zip(labels, values)):
+        print(
+            f"│ {label.ljust(label_width)} │ "
+            f"{value.ljust(value_width)} │"
+        )
+        if index != len(rows) - 1:
+            print(middle)
+    print(bottom)
 
 
 def configure_request_logging(verbose: bool = False) -> Path:
@@ -319,6 +343,13 @@ def local_ip() -> str:
         sock.close()
 
 
+def is_loopback_address(value: str) -> bool:
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False
+
+
 def is_same_or_child(path: Path, possible_parent: Path) -> bool:
     """True si path es possible_parent o está dentro de él."""
     return path == possible_parent or possible_parent in path.parents
@@ -330,7 +361,7 @@ def is_same_or_child(path: Path, possible_parent: Path) -> bool:
 
 
 class ShareHandler(BaseHTTPRequestHandler):
-    server_version = "SimpleShare/2.6"
+    server_version = "SimpleShare/2.7"
 
     POST_ROUTES = {
         "/api/upload": "handle_upload",
@@ -367,6 +398,10 @@ class ShareHandler(BaseHTTPRequestHandler):
         return bool(value) and hmac.compare_digest(value, ACCESS_TOKEN)
 
     def is_authenticated(self) -> bool:
+        # El propio equipo puede acceder por localhost sin OTP.
+        if is_loopback_address(self.client_address[0]):
+            return True
+
         raw_cookie = self.headers.get("Cookie", "")
         if not raw_cookie:
             return False
@@ -1258,21 +1293,21 @@ def run_cli(args):
     host = display_host(args.bind)
 
     print()
-    print("Simple Share 2.6")
+    print("Simple Share 2.7")
     print("================")
-    print(f"Carpeta:      {ROOT}")
-    print(f"Puerto:       {args.port}")
+    print_console_grid(
+        [
+            ("Carpeta", ROOT),
+            ("Puerto", args.port),
+            ("Localhost", f"http://127.0.0.1:{args.port}/"),
+            ("Red local", f"http://{host}:{args.port}/"),
+            ("Registro", REQUEST_LOG_PATH or "No disponible"),
+        ]
+    )
     print()
-    print("Abre Simple Share desde el navegador:")
-    print(f"Este equipo:  http://127.0.0.1:{args.port}/")
-    print(f"Red local:    http://{host}:{args.port}/")
-    print()
-    print("El código cambia cada 30 s; la sesión del navegador permanece activa.")
-    if REQUEST_LOG_PATH is not None:
-        print(f"Registro:      {REQUEST_LOG_PATH}")
-    print()
-    print("Funciones: subir, descargar, crear carpetas, mover, copiar, renombrar y eliminar.")
-    print("Uso recomendado: redes locales de confianza. No expongas este puerto a Internet.")
+    print("Localhost entra directamente; el OTP solo protege el acceso desde la red local.")
+    print("El código cambia cada 30 s; una sesión LAN iniciada permanece activa.")
+    print("Las peticiones se guardan en el registro; usa --verbose para verlas también aquí.")
     print("Ctrl+C para detener.")
     print()
 
@@ -1598,7 +1633,7 @@ setInterval(status,500);
     control_url = f"http://127.0.0.1:{control_port}/"
 
     print()
-    print("Simple Share 2.6 · Panel web")
+    print("Simple Share 2.7 · Panel web")
     print("============================")
     print(f"Panel local:  {control_url}")
     print(f"Carpeta:      {ROOT}")
