@@ -105,7 +105,7 @@ python3 simple_share.py --web-gui
 At startup, the terminal prints the local URLs and a temporary 6-digit pairing code that rotates every 30 seconds:
 
 ```text
-Simple Share 2.6
+Simple Share 2.7
 ================
 Carpeta:      /home/user/shared
 Puerto:       8000
@@ -213,6 +213,8 @@ The server includes several protections while keeping the project dependency-fre
 Every time the server starts, Simple Share generates a cryptographically random secret used to derive a **6-digit time-based pairing code**. The visible code rotates every 30 seconds. A separate **cryptographically strong random session token** is used internally by the browser cookie.
 
 Open the normal LAN URL and enter the current short pairing code. Simple Share accepts the current 30-second interval and the immediately previous interval so a code does not fail just because it rotated while you were typing. After successful pairing, the browser receives the session cookie and does not need to re-enter a code every 30 seconds. The long session token is never shown in the URL.
+
+Requests coming directly from the same machine through the loopback interface (`127.0.0.1` or `::1`) are trusted and do **not** require the pairing code. The bypass is based on the actual client socket address, not on the `Host` header, so another device cannot gain local access merely by requesting a hostname such as `localhost`.
 
 The cookie uses:
 
