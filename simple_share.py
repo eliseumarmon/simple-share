@@ -17,6 +17,7 @@ import socket
 import subprocess
 import sys
 import threading
+import textwrap
 import time
 import urllib.parse
 import uuid
@@ -26,6 +27,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from datetime import datetime
 
+
+APP_NAME = "Simple Share"
+APP_VERSION = "2.14"
 
 ROOT: Path | None = None
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
@@ -41,9 +45,8 @@ AUTH_FAILURES: dict[str, list[float]] = {}
 AUTH_LOCK = threading.Lock()
 REQUEST_LOGGER = logging.getLogger("simple_share.requests")
 REQUEST_LOG_PATH: Path | None = None
-CONSOLE_STATUS_LOCK = threading.RLock()
-CONSOLE_STATUS_ACTIVE = False
-CONSOLE_STATUS_WIDTH = 0
+CONSOLE_LOCK = threading.RLock()
+CONSOLE_DASHBOARD = None
 
 
 # ============================================================
@@ -55,19 +58,62 @@ def script_directory() -> Path:
     return Path(__file__).resolve().parent
 
 
-def console_status_width() -> int:
-    """Ancho seguro para evitar que la línea dinámica haga wrap."""
-    columns = shutil.get_terminal_size(fallback=(80, 24)).columns
+def terminal_dimensions() -> tuple[int, int]:
+    """
+    Devuelve un área segura de dibujo.
 
-    # Evitamos ocupar la última columna: algunos terminales hacen wrap
-    # automáticamente justo al escribir en ella.
-    return max(1, columns - 1)
+    Reservamos una columna para evitar el wrap automático de algunos
+    terminales al escribir exactamente en la última celda.
+    """
+    size = shutil.get_terminal_size(fallback=(100, 24))
+    return max(1, size.columns - 1), max(1, size.lines)
 
 
-def current_console_status() -> str:
+def shorten_middle(value: str, max_width: int) -> str:
+    """Acorta texto largo conservando el principio y el final."""
+    if max_width <= 0:
+        return ""
+    if len(value) <= max_width:
+        return value
+    if max_width == 1:
+        return "…"
+    if max_width <= 3:
+        return value[:max_width]
+
+    available = max_width - 1
+    left = (available + 1) // 2
+    right = available - left
+    return f"{value[:left]}…{value[-right:] if right else ''}"
+
+
+def shorten_end(value: str, max_width: int) -> str:
+    """Acorta texto normal por el final."""
+    if max_width <= 0:
+        return ""
+    if len(value) <= max_width:
+        return value
+    if max_width == 1:
+        return "…"
+    return value[:max_width - 1] + "…"
+
+
+def supports_console_hyperlinks() -> bool:
+    if sys.stdout is None or not sys.stdout.isatty():
+        return False
+    return os.environ.get("TERM", "").lower() != "dumb"
+
+
+def console_hyperlink(text: str, target: str | None) -> str:
+    """Crea un enlace OSC 8 cuando el terminal lo permite."""
+    if not target or not supports_console_hyperlinks():
+        return text
+    return f"\033]8;;{target}\033\\{text}\033]8;;\033\\"
+
+
+def current_console_status(max_width: int) -> str:
+    """Devuelve la variante de OTP más detallada que cabe."""
     code = current_access_code()
     remaining = seconds_until_next_code()
-    max_width = console_status_width()
 
     variants = [
         f"Código de acceso LAN: {code} · cambia en {remaining:02d} s",
@@ -81,113 +127,12 @@ def current_console_status() -> str:
         if len(text) <= max_width:
             return text
 
-    return code[:max_width]
+    return shorten_end(code, max_width)
 
 
-def _clear_console_status_unlocked():
-    global CONSOLE_STATUS_WIDTH
-
-    if not CONSOLE_STATUS_ACTIVE or sys.stdout is None:
-        return
-
-    current_width = console_status_width()
-
-    if sys.stdout.isatty():
-        # Borra la línea completa sin imprimir una cadena de espacios que
-        # podría volver a provocar wrap en terminales estrechos.
-        sys.stdout.write("\r\033[2K")
-    elif CONSOLE_STATUS_WIDTH > 0:
-        clear_width = min(CONSOLE_STATUS_WIDTH, current_width)
-        sys.stdout.write("\r" + (" " * clear_width) + "\r")
-
-    sys.stdout.flush()
-    CONSOLE_STATUS_WIDTH = 0
-
-
-def _draw_console_status_unlocked():
-    global CONSOLE_STATUS_WIDTH
-
-    if not CONSOLE_STATUS_ACTIVE or sys.stdout is None:
-        return
-
-    text = current_console_status()
-
-    # El ancho puede cambiar en cualquier momento al redimensionar la ventana.
-    # Limpiamos primero y recalculamos en cada refresco.
-    _clear_console_status_unlocked()
-    text = text[:console_status_width()]
-    CONSOLE_STATUS_WIDTH = len(text)
-
-    sys.stdout.write("\r" + text)
-    sys.stdout.flush()
-
-
-def draw_console_status():
-    with CONSOLE_STATUS_LOCK:
-        _draw_console_status_unlocked()
-
-
-def finish_console_status():
-    global CONSOLE_STATUS_ACTIVE, CONSOLE_STATUS_WIDTH
-
-    with CONSOLE_STATUS_LOCK:
-        _clear_console_status_unlocked()
-        CONSOLE_STATUS_ACTIVE = False
-        CONSOLE_STATUS_WIDTH = 0
-
-
-class StatusAwareConsoleHandler(logging.StreamHandler):
-    """Escribe logs sin dejar rota la línea dinámica del OTP."""
-
-    def emit(self, record):
-        try:
-            message = self.format(record)
-
-            with CONSOLE_STATUS_LOCK:
-                _clear_console_status_unlocked()
-                self.stream.write(message + self.terminator)
-                self.flush()
-                _draw_console_status_unlocked()
-        except Exception:
-            self.handleError(record)
-
-
-def shorten_middle(value: str, max_width: int) -> str:
-    """Acorta texto largo conservando el principio y el final."""
-    if len(value) <= max_width:
-        return value
-
-    if max_width <= 3:
-        return value[:max_width]
-
-    available = max_width - 1
-    left = (available + 1) // 2
-    right = available - left
-    return f"{value[:left]}…{value[-right:] if right else ''}"
-
-
-def supports_console_hyperlinks() -> bool:
-    if sys.stdout is None or not sys.stdout.isatty():
-        return False
-    return os.environ.get("TERM", "").lower() != "dumb"
-
-
-def console_hyperlink(text: str, target: str | None) -> str:
-    """Crea un enlace OSC 8 cuando el terminal lo permite."""
-    if not target or not supports_console_hyperlinks():
-        return text
-
-    return f"\033]8;;{target}\033\\{text}\033]8;;\033\\"
-
-
-def print_console_grid(rows):
-    """
-    Imprime una tabla compacta adaptada al ancho de terminal.
-
-    Cada fila puede ser (label, value) o (label, value, hyperlink_target).
-    Tanto la columna de etiquetas como la de valores pueden encogerse.
-    """
+def normalize_console_rows(rows):
     normalized = []
+
     for row in rows:
         if len(row) == 2:
             label, value = row
@@ -197,60 +142,74 @@ def print_console_grid(rows):
 
         normalized.append((str(label), str(value), target))
 
+    return normalized
+
+
+def build_box_title(width: int, title: str) -> str:
+    """Construye el borde superior integrando un título adaptable."""
+    if width <= 2:
+        return shorten_end(title, width)
+
+    inner_width = width - 2
+    title_text = shorten_end(title, max(1, inner_width - 2))
+    decorated = f" {title_text} "
+
+    if len(decorated) > inner_width:
+        decorated = shorten_end(title_text, inner_width)
+
+    remaining = max(0, inner_width - len(decorated))
+    left = remaining // 2
+    right = remaining - left
+
+    return f"┌{'─' * left}{decorated}{'─' * right}┐"
+
+
+def build_console_grid(rows, max_width: int, title: str) -> list[str]:
+    """Construye la cuadrícula sin superar nunca max_width."""
+    normalized = normalize_console_rows(rows)
+
     if not normalized:
-        return
+        return [shorten_end(title, max_width)]
 
-    terminal_width = shutil.get_terminal_size(fallback=(100, 24)).columns
-
-    # Reservamos siempre la última columna. Algunos terminales hacen wrap
-    # automático al escribir exactamente en ella.
-    safe_width = max(1, terminal_width - 1)
-    table_width = min(safe_width, 120)
-
-    # Una tabla de dos columnas necesita 7 caracteres estructurales:
-    # │ + espacios interiores + │ + espacios interiores + │.
-    # Con anchos absurdamente pequeños degradamos a una sola línea por fila.
-    if table_width < 9:
-        for label, value, target in normalized:
-            combined = f"{label}: {value}"
-            visible = shorten_middle(combined, safe_width)
-            print(console_hyperlink(visible, target))
-        return
+    # Por debajo de este ancho la estructura de dos columnas deja demasiado
+    # poco espacio útil. El dashboard usará su representación compacta.
+    if max_width < 18:
+        return [shorten_end(title, max_width)]
 
     desired_label_width = max(len(label) for label, _, _ in normalized)
     desired_value_width = max(len(value) for _, value, _ in normalized)
+    natural_width = max(
+        len(title) + 4,
+        desired_label_width + desired_value_width + 7,
+    )
+    table_width = min(max_width, natural_width)
     content_budget = table_width - 7
 
-    # Si todo cabe, conservamos el tamaño natural. Si no, repartimos el ancho
-    # proporcionalmente: también se encogen etiquetas, URLs e IPs.
-    desired_total = desired_label_width + desired_value_width
-    if desired_total <= content_budget:
-        label_width = desired_label_width
+    if content_budget < 2:
+        return [shorten_end(title, max_width)]
+
+    # La etiqueta recibe como máximo un tercio del espacio cuando hay que
+    # encoger la tabla; el valor conserva el resto para rutas y URLs.
+    label_width = min(
+        desired_label_width,
+        max(1, content_budget // 3),
+    )
+    value_width = max(1, content_budget - label_width)
+
+    # Si los valores ya caben completos, devolvemos el espacio sobrante
+    # a las etiquetas.
+    if value_width > desired_value_width:
+        spare = value_width - desired_value_width
         value_width = desired_value_width
-    else:
-        label_width = max(
-            1,
-            round(content_budget * desired_label_width / max(1, desired_total)),
-        )
-        value_width = max(1, content_budget - label_width)
+        label_width = min(desired_label_width, label_width + spare)
 
-        # Si una columna ya cabe completa, cedemos el espacio sobrante a la otra.
-        if label_width > desired_label_width:
-            extra = label_width - desired_label_width
-            label_width = desired_label_width
-            value_width += extra
-
-        if value_width > desired_value_width:
-            extra = value_width - desired_value_width
-            value_width = desired_value_width
-            label_width += extra
-
-        # Protege el presupuesto tras los reajustes.
-        label_width = max(1, min(label_width, content_budget - 1))
-        value_width = max(1, content_budget - label_width)
+    # Si las etiquetas ya caben, todo el sobrante queda para los valores.
+    used = label_width + value_width
+    if used < content_budget:
+        value_width += content_budget - used
 
     visible_labels = [
-        shorten_middle(label, label_width)
+        shorten_end(label, label_width)
         for label, _, _ in normalized
     ]
     visible_values = [
@@ -258,11 +217,12 @@ def print_console_grid(rows):
         for _, value, _ in normalized
     ]
 
-    top = f"┌{'─' * (label_width + 2)}┬{'─' * (value_width + 2)}┐"
+    top = build_box_title(table_width, title)
     middle = f"├{'─' * (label_width + 2)}┼{'─' * (value_width + 2)}┤"
     bottom = f"└{'─' * (label_width + 2)}┴{'─' * (value_width + 2)}┘"
 
-    print(top)
+    lines = [top]
+
     for index, ((_, _value, target), label, value) in enumerate(
         zip(normalized, visible_labels, visible_values)
     ):
@@ -270,13 +230,236 @@ def print_console_grid(rows):
         label_padding = " " * (label_width - len(label))
         value_padding = " " * (value_width - len(value))
 
-        print(
+        lines.append(
             f"│ {label}{label_padding} │ "
             f"{linked}{value_padding} │"
         )
+
         if index != len(normalized) - 1:
-            print(middle)
-    print(bottom)
+            lines.append(middle)
+
+    lines.append(bottom)
+    return lines
+
+
+def build_compact_rows(rows, max_width: int) -> list[str]:
+    """Representación de una línea por dato para terminales bajas/estrechas."""
+    normalized = normalize_console_rows(rows)
+    short_labels = {
+        "Localhost": "Local",
+        "Red local": "LAN",
+        "Registro": "Log",
+    }
+    lines = []
+
+    for label, value, target in normalized:
+        label = short_labels.get(label, label)
+        prefix = f"{label}: "
+
+        if len(prefix) >= max_width:
+            lines.append(shorten_end(label, max_width))
+            continue
+
+        visible = shorten_middle(value, max_width - len(prefix))
+        lines.append(prefix + console_hyperlink(visible, target))
+
+    return lines
+
+
+def build_explanation_lines(max_width: int) -> list[str]:
+    """Textos breves que también se recalculan al cambiar el ancho."""
+    messages = [
+        "Localhost entra directamente; el OTP solo protege el acceso desde la LAN.",
+        "El OTP cambia cada 30 s; una sesión iniciada permanece activa.",
+        "Las peticiones se guardan en el log; --verbose también las muestra aquí.",
+        "Ctrl+C: detener.",
+    ]
+
+    lines = []
+    for message in messages:
+        wrapped = textwrap.wrap(
+            message,
+            width=max_width,
+            break_long_words=False,
+            break_on_hyphens=False,
+        )
+        lines.extend(wrapped or [""])
+
+    return lines
+
+
+def build_console_dashboard(rows, width: int, height: int) -> list[str]:
+    """
+    Construye todo el dashboard dentro del ancho y alto disponibles.
+
+    En terminales normales mantiene: cuadrícula -> explicación -> OTP.
+    Si falta altura degrada progresivamente sin hacer scroll.
+    """
+    title = f"{APP_NAME} {APP_VERSION}"
+    status = current_console_status(width)
+
+    if height <= 1:
+        return [status]
+
+    if height == 2:
+        return [shorten_end(title, width), status]
+
+    grid = build_console_grid(rows, width, title)
+
+    # Si la cuadrícula cabe, es la representación preferida.
+    if len(grid) + 1 <= height:
+        lines = list(grid)
+        remaining = height - len(lines) - 1  # siempre reservamos OTP
+
+        explanations = build_explanation_lines(width)
+        if remaining >= 2 and explanations:
+            lines.append("")
+            remaining -= 1
+
+            for line in explanations:
+                if remaining <= 0:
+                    break
+                lines.append(shorten_end(line, width))
+                remaining -= 1
+
+            if remaining > 0:
+                lines.append("")
+
+        lines.append(status)
+        return lines[:height]
+
+    # Poca altura: título + datos prioritarios + OTP.
+    compact = build_compact_rows(rows, width)
+    priority = [0, 2, 3, 4, 1]  # puerto es redundante con las URLs
+    compact = [compact[i] for i in priority if i < len(compact)]
+
+    available_rows = max(0, height - 2)
+    return [
+        shorten_end(title, width),
+        *compact[:available_rows],
+        status,
+    ]
+
+
+class ConsoleDashboard:
+    """Dashboard responsivo que conserva los logs por encima de él."""
+
+    def __init__(self, rows):
+        self.rows = rows
+        self.active = False
+        self.rendered_lines = 0
+        self.last_size: tuple[int, int] | None = None
+        self.last_status = ""
+        self.dynamic = bool(sys.stdout is not None and sys.stdout.isatty())
+
+    def _size(self) -> tuple[int, int]:
+        return terminal_dimensions()
+
+    def _lines(self, size: tuple[int, int]) -> list[str]:
+        width, height = size
+        return build_console_dashboard(self.rows, width, height)
+
+    def _erase_unlocked(self):
+        if not self.dynamic or self.rendered_lines <= 0 or sys.stdout is None:
+            return
+
+        # El cursor queda siempre en la última línea del dashboard.
+        # Borramos hacia arriba sin afectar a los logs anteriores.
+        for index in range(self.rendered_lines):
+            sys.stdout.write("\r\033[2K")
+            if index < self.rendered_lines - 1:
+                sys.stdout.write("\033[1A")
+
+        sys.stdout.flush()
+        self.rendered_lines = 0
+
+    def _render_full_unlocked(self, size: tuple[int, int] | None = None):
+        if sys.stdout is None:
+            return
+
+        size = size or self._size()
+        lines = self._lines(size)
+
+        if self.dynamic:
+            self._erase_unlocked()
+            sys.stdout.write("\n".join(lines))
+            sys.stdout.flush()
+            self.rendered_lines = len(lines)
+        else:
+            sys.stdout.write("\n".join(lines) + "\n")
+            sys.stdout.flush()
+
+        self.last_size = size
+        self.last_status = lines[-1] if lines else ""
+
+    def start(self):
+        with CONSOLE_LOCK:
+            self.active = True
+            self._render_full_unlocked()
+
+    def refresh(self):
+        if not self.active or not self.dynamic or sys.stdout is None:
+            return
+
+        with CONSOLE_LOCK:
+            size = self._size()
+
+            # El ancho o el alto han cambiado: reconstruimos TODO.
+            if size != self.last_size:
+                self._render_full_unlocked(size)
+                return
+
+            width, _height = size
+            status = current_console_status(width)
+
+            # Sin resize solo cambia la última línea: evitamos parpadeos.
+            if status != self.last_status:
+                sys.stdout.write("\r\033[2K" + status)
+                sys.stdout.flush()
+                self.last_status = status
+
+    def write_log(self, message: str):
+        if sys.stdout is None:
+            return
+
+        with CONSOLE_LOCK:
+            if not self.active or not self.dynamic:
+                sys.stdout.write(message + "\n")
+                sys.stdout.flush()
+                return
+
+            self._erase_unlocked()
+            sys.stdout.write(message + "\n")
+            sys.stdout.flush()
+            self.last_size = None
+            self.last_status = ""
+            self._render_full_unlocked()
+
+    def stop(self):
+        with CONSOLE_LOCK:
+            if self.dynamic:
+                self._erase_unlocked()
+
+            self.active = False
+            self.last_size = None
+            self.last_status = ""
+
+
+class StatusAwareConsoleHandler(logging.StreamHandler):
+    """Envía logs a consola sin romper el dashboard responsivo."""
+
+    def emit(self, record):
+        try:
+            message = self.format(record)
+            dashboard = CONSOLE_DASHBOARD
+
+            if dashboard is not None:
+                dashboard.write_log(message)
+            else:
+                self.stream.write(message + self.terminator)
+                self.flush()
+        except Exception:
+            self.handleError(record)
 
 
 def configure_request_logging(verbose: bool = False) -> Path:
@@ -432,19 +615,18 @@ def seconds_until_next_code() -> int:
     return max(1, remaining)
 
 
-def otp_console_loop(stop_event: threading.Event):
-    """Mantiene el OTP y su cuenta atrás en una única línea de consola."""
-    global CONSOLE_STATUS_ACTIVE
-
-    with CONSOLE_STATUS_LOCK:
-        CONSOLE_STATUS_ACTIVE = True
-        _draw_console_status_unlocked()
+def console_dashboard_loop(
+    stop_event: threading.Event,
+    dashboard: ConsoleDashboard,
+):
+    """Refresca OTP y redibuja el dashboard cuando cambia el tamaño."""
+    dashboard.start()
 
     try:
         while not stop_event.wait(0.25):
-            draw_console_status()
+            dashboard.refresh()
     finally:
-        finish_console_status()
+        dashboard.stop()
 
 
 def svg_icon(name: str, css_class: str = "icon") -> str:
@@ -502,7 +684,7 @@ def is_same_or_child(path: Path, possible_parent: Path) -> bool:
 
 
 class ShareHandler(BaseHTTPRequestHandler):
-    server_version = "SimpleShare/2.13"
+    server_version = f"SimpleShare/{APP_VERSION}"
 
     POST_ROUTES = {
         "/api/upload": "handle_upload",
@@ -1429,50 +1611,46 @@ def open_shared_folder():
 
 
 def run_cli(args):
+    global CONSOLE_DASHBOARD
+
     configure_runtime(args)
     server = create_server(args)
     host = display_host(args.bind)
 
-    print()
-    print("Simple Share 2.13")
-    print("================")
-    print_console_grid(
-        [
-            ("Carpeta", ROOT, ROOT.as_uri()),
-            ("Puerto", args.port),
-            ("Localhost", f"http://127.0.0.1:{args.port}/"),
-            ("Red local", f"http://{host}:{args.port}/"),
-            (
-                "Registro",
-                REQUEST_LOG_PATH or "No disponible",
-                REQUEST_LOG_PATH.parent.as_uri()
-                if REQUEST_LOG_PATH is not None
-                else None,
-            ),
-        ]
-    )
-    print()
-    print("Localhost entra directamente; el OTP solo protege el acceso desde la red local.")
-    print("El código cambia cada 30 s; una sesión LAN iniciada permanece activa.")
-    print("Las peticiones se guardan en el registro; usa --verbose para verlas también aquí.")
-    print("Ctrl+C para detener.")
-    print()
+    rows = [
+        ("Carpeta", ROOT, ROOT.as_uri()),
+        ("Puerto", args.port),
+        ("Localhost", f"http://127.0.0.1:{args.port}/"),
+        ("Red local", f"http://{host}:{args.port}/"),
+        (
+            "Registro",
+            REQUEST_LOG_PATH or "No disponible",
+            REQUEST_LOG_PATH.parent.as_uri()
+            if REQUEST_LOG_PATH is not None
+            else None,
+        ),
+    ]
 
-    otp_stop = threading.Event()
-    otp_thread = threading.Thread(
-        target=otp_console_loop,
-        args=(otp_stop,),
+    dashboard = ConsoleDashboard(rows)
+    CONSOLE_DASHBOARD = dashboard
+
+    dashboard_stop = threading.Event()
+    dashboard_thread = threading.Thread(
+        target=console_dashboard_loop,
+        args=(dashboard_stop, dashboard),
         daemon=True,
+        name="simple-share-console",
     )
-    otp_thread.start()
+    dashboard_thread.start()
 
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
-        otp_stop.set()
-        otp_thread.join(timeout=1)
+        dashboard_stop.set()
+        dashboard_thread.join(timeout=1)
+        CONSOLE_DASHBOARD = None
         server.server_close()
 
     print("Servidor detenido.")
