@@ -105,7 +105,7 @@ python3 simple_share.py --web-gui
 At startup, the terminal prints the local URLs and a temporary 6-digit pairing code that rotates every 30 seconds:
 
 ```text
-Simple Share 2.5
+Simple Share 2.6
 ================
 Carpeta:      /home/user/shared
 Puerto:       8000
@@ -140,7 +140,7 @@ The directory is created automatically if it does not exist.
 ```text
 usage: simple_share.py [-h] [-p PORT] [-b BIND]
                        [--max-upload-mb MAX_UPLOAD_MB] [--gui] [--web-gui]
-                       [directory]
+                       [-v] [directory]
 ```
 
 Examples:
@@ -163,9 +163,44 @@ python3 simple_share.py --gui
 
 # Force the zero-dependency browser control panel
 python3 simple_share.py --web-gui
+
+# Also show HTTP requests in the terminal
+python3 simple_share.py --verbose
 ```
 
 The default upload limit is **2048 MB per file**.
+
+
+## Request logging
+
+HTTP requests are logged automatically to a `simple_share_logs` directory next to `simple_share.py`.
+
+For example:
+
+```text
+simple-share/
+├── simple_share.py
+└── simple_share_logs/
+    └── simple_share_2026-09-29.log
+```
+
+A single log file is reused for each calendar day and new entries are appended to it.
+
+By default, request lines are **not printed to the terminal**, keeping the CLI clean while the OTP refreshes in place on a single line.
+
+To also print HTTP requests to the terminal:
+
+```bash
+python3 simple_share.py --verbose
+```
+
+or:
+
+```bash
+python3 simple_share.py -v
+```
+
+When verbose mode is enabled, request lines are printed without breaking the live OTP status line.
 
 ## Security model
 
@@ -235,6 +270,7 @@ Simple Share is intentionally built without a web framework. It uses Python's st
 - `urllib.parse` for URL handling
 - `secrets`, `hmac`, and `hashlib` for rotating pairing codes and session tokens
 - `http.cookies` for the session cookie
+- `logging` for daily request logs
 - `webbrowser` for launching the local browser control panel
 - vanilla HTML, CSS, and JavaScript for the interfaces
 
