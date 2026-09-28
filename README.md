@@ -32,6 +32,8 @@ Everything lives in a single Python file and uses only the Python standard libra
 
 No `pip install` is required.
 
+The optional desktop GUI uses **Tkinter**, which is included with standard Python installations on Windows and macOS. Some minimal Linux distributions package Tkinter separately; the CLI and web interface do not require it.
+
 ## Quick start
 
 Clone the repository or download `simple_share.py`, then run:
@@ -56,6 +58,35 @@ If no directory is specified, Simple Share automatically creates and uses:
 
 - Linux/macOS: `~/shared`
 - Windows: `C:\shared`
+
+### Optional desktop GUI
+
+Simple Share also includes a small desktop control panel:
+
+```bash
+python3 simple_share.py --gui
+```
+
+On Windows:
+
+```powershell
+python simple_share.py --gui
+```
+
+The GUI provides four controls:
+
+- **Start** — starts the HTTP server and generates a fresh session/OTP secret
+- **Stop** — stops the server
+- **Open folder** — opens the shared directory in the operating-system file manager
+- **Open browser** — opens the local Simple Share URL
+
+It also shows the server status, LAN URL, current 6-digit OTP, and the countdown until the next code.
+
+On Windows, the GUI can be launched without a console window with:
+
+```powershell
+pythonw.exe simple_share.py --gui
+```
 
 At startup, the terminal prints the local URLs and a temporary 6-digit pairing code that rotates every 30 seconds:
 
@@ -94,7 +125,7 @@ The directory is created automatically if it does not exist.
 
 ```text
 usage: simple_share.py [-h] [-p PORT] [-b BIND]
-                       [--max-upload-mb MAX_UPLOAD_MB]
+                       [--max-upload-mb MAX_UPLOAD_MB] [--gui]
                        [directory]
 ```
 
@@ -112,6 +143,9 @@ python3 simple_share.py --max-upload-mb 500
 
 # Listen only on the local machine
 python3 simple_share.py --bind 127.0.0.1
+
+# Open the desktop control panel
+python3 simple_share.py --gui
 ```
 
 The default upload limit is **2048 MB per file**.
