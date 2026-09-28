@@ -32,11 +32,11 @@ Everything lives in a single Python file and uses only the Python standard libra
 
 No `pip install` is required.
 
-The control interface is platform-aware:
+The control interface auto-detects what is available:
 
-- **Windows:** `--gui` uses the native Tkinter window included with normal Python installations.
-- **Linux/macOS:** `--gui` opens a local browser-based control panel built entirely with the Python standard library.
-- **Any platform:** `--web-gui` forces the browser-based control panel.
+- `--gui` tries the native **Tkinter** window first on Windows, Linux, and macOS.
+- If Tkinter is not available, `--gui` automatically falls back to the local browser-based control panel.
+- `--web-gui` always forces the browser-based control panel.
 
 The web control panel requires no extra Python packages.
 
@@ -82,19 +82,15 @@ The interface provides:
 
 It also shows the server status, LAN URL, current 6-digit OTP, and the countdown until the next code.
 
-On **Windows**, `--gui` uses Tkinter:
+`--gui` uses Tkinter whenever the current Python installation provides it. This works on Windows and also on Linux/macOS installations where Tkinter is installed.
 
-```powershell
-python simple_share.py --gui
-```
-
-It can also be launched without a console window:
+On Windows it can also be launched without a console window:
 
 ```powershell
 pythonw.exe simple_share.py --gui
 ```
 
-On **Linux and macOS**, `--gui` opens the zero-dependency control panel in the default browser. The control panel itself listens only on `127.0.0.1`; the file-sharing server still listens on the configured LAN address when you press **Start**.
+If Tkinter is unavailable, Simple Share automatically opens the zero-dependency browser control panel instead. That control panel listens only on `127.0.0.1`; the file-sharing server still listens on the configured LAN address when you press **Start**.
 
 To force the browser control panel on any platform:
 
@@ -105,7 +101,7 @@ python3 simple_share.py --web-gui
 At startup, the terminal prints the local URLs and a temporary 6-digit pairing code that rotates every 30 seconds:
 
 ```text
-Simple Share 2.7
+Simple Share 2.8
 ================
 Carpeta:      /home/user/shared
 Puerto:       8000
