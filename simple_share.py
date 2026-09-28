@@ -225,7 +225,7 @@ def is_same_or_child(path: Path, possible_parent: Path) -> bool:
 
 
 class ShareHandler(BaseHTTPRequestHandler):
-    server_version = "SimpleShare/2.4"
+    server_version = "SimpleShare/2.5"
 
     POST_ROUTES = {
         "/api/upload": "handle_upload",
@@ -1149,7 +1149,7 @@ def run_cli(args):
     host = display_host(args.bind)
 
     print()
-    print("Simple Share 2.4")
+    print("Simple Share 2.5")
     print("================")
     print(f"Carpeta:      {ROOT}")
     print(f"Puerto:       {args.port}")
@@ -1184,6 +1184,330 @@ def run_cli(args):
     finally:
         otp_stop.set()
         server.server_close()
+
+
+def run_web_gui(args):
+    """Panel de control local en el navegador, sin dependencias externas."""
+    try:
+        configure_runtime(args)
+    except RuntimeError as exc:
+        print(exc)
+        return 1
+
+    control_token = secrets.token_urlsafe(32)
+    share_url = f"http://{display_host(args.bind)}:{args.port}/"
+    state_lock = threading.Lock()
+    state = {"server": None, "thread": None}
+
+    def running():
+        with state_lock:
+            return state["server"] is not None
+
+    def start_share():
+        with state_lock:
+            if state["server"] is not None:
+                return True, None
+
+            try:
+                server = create_server(args)
+            except RuntimeError as exc:
+                return False, str(exc)
+
+            thread = threading.Thread(
+                target=server.serve_forever,
+                daemon=True,
+                name="simple-share-http",
+            )
+            state["server"] = server
+            state["thread"] = thread
+            thread.start()
+            return True, None
+
+    def stop_share():
+        with state_lock:
+            server = state["server"]
+            state["server"] = None
+            state["thread"] = None
+
+        if server is None:
+            return
+
+        try:
+            server.shutdown()
+        finally:
+            server.server_close()
+
+    class ControlHandler(BaseHTTPRequestHandler):
+        server_version = "SimpleShareControl/1.0"
+
+        def log_message(self, fmt, *args_):
+            return
+
+        def add_headers(self):
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'self'; script-src 'unsafe-inline'; "
+                "style-src 'unsafe-inline'; connect-src 'self'; "
+                "img-src 'self' data:; object-src 'none'; "
+                "base-uri 'none'; frame-ancestors 'none'",
+            )
+
+        def authorized(self):
+            supplied = self.headers.get("X-Simple-Share-Control", "")
+            return hmac.compare_digest(supplied, control_token)
+
+        def send_json(self, data, status=200):
+            body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.add_headers()
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            path = urllib.parse.urlsplit(self.path).path
+
+            if path == "/favicon.ico":
+                self.send_response(204)
+                self.add_headers()
+                self.end_headers()
+                return
+
+            if path == "/api/status":
+                if not self.authorized():
+                    self.send_json({"ok": False, "error": "No autorizado"}, 403)
+                    return
+
+                is_running = running()
+                code = current_access_code() if is_running else ""
+                self.send_json(
+                    {
+                        "ok": True,
+                        "running": is_running,
+                        "url": share_url,
+                        "folder": str(require_root()),
+                        "code": code,
+                        "remaining": seconds_until_next_code() if is_running else 0,
+                    }
+                )
+                return
+
+            if path != "/":
+                self.send_error(404)
+                return
+
+            page = r'''<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Simple Share · Control</title>
+<style>
+*{box-sizing:border-box}
+:root{color-scheme:dark}
+body{margin:0;min-height:100vh;background:#111827;color:#e5e7eb;
+font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+display:grid;place-items:center;padding:24px}
+.shell{width:min(100%,560px)}
+header{display:flex;align-items:center;justify-content:space-between;margin-bottom:20px}
+h1{font-size:1.6rem;margin:0}
+.status{display:flex;align-items:center;gap:8px;font-size:.92rem;font-weight:700}
+.dot{width:10px;height:10px;border-radius:999px;background:#6b7280}
+.dot.active{background:#22c55e;box-shadow:0 0 0 4px rgba(34,197,94,.12)}
+.card{background:#1f2937;border:1px solid #374151;border-radius:16px;padding:24px;
+box-shadow:0 18px 50px rgba(0,0,0,.22)}
+.otp{text-align:center;padding:8px 0 22px}
+.eyebrow,.label{color:#9ca3af;font-size:.82rem}
+.code{font:700 2.25rem ui-monospace,SFMono-Regular,Consolas,monospace;
+letter-spacing:.13em;margin:6px 0}
+.countdown{color:#9ca3af;font-size:.86rem}
+.info{display:grid;gap:14px;margin-bottom:20px}
+.value{margin-top:4px;font:500 .93rem ui-monospace,SFMono-Regular,Consolas,monospace;
+overflow-wrap:anywhere}
+.actions{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+button{appearance:none;border:0;border-radius:10px;padding:13px 15px;
+font:700 .95rem system-ui;cursor:pointer;background:#374151;color:#fff}
+button:hover:not(:disabled){background:#4b5563}
+button.primary{background:#2563eb}
+button.primary:hover:not(:disabled){background:#1d4ed8}
+button:disabled{opacity:.42;cursor:not-allowed}
+.message{min-height:22px;margin-top:14px;color:#9ca3af;font-size:.86rem;text-align:center}
+.message.error{color:#fca5a5}
+@media(max-width:480px){.actions{grid-template-columns:1fr}.card{padding:20px}.code{font-size:1.9rem}}
+</style>
+</head>
+<body>
+<main class="shell">
+<header>
+<h1>Simple Share</h1>
+<div class="status"><span id="dot" class="dot"></span><span id="status">Detenido</span></div>
+</header>
+<section class="card">
+<div class="otp">
+<div class="eyebrow">Código de acceso</div>
+<div id="code" class="code">--- ---</div>
+<div id="countdown" class="countdown">Servidor detenido</div>
+</div>
+<div class="info">
+<div><div class="label">URL local</div><div id="url" class="value">—</div></div>
+<div><div class="label">Carpeta compartida</div><div id="folder" class="value">—</div></div>
+</div>
+<div class="actions">
+<button id="start" class="primary">Iniciar</button>
+<button id="stop">Detener</button>
+<button id="folderButton">Abrir carpeta</button>
+<button id="browserButton">Abrir navegador</button>
+</div>
+<div id="message" class="message"></div>
+</section>
+</main>
+<script>
+const TOKEN="__CONTROL_TOKEN__";
+const headers={"X-Simple-Share-Control":TOKEN};
+let currentUrl="";
+const get=id=>document.getElementById(id);
+
+async function status(){
+  try{
+    const response=await fetch("/api/status",{headers:headers,cache:"no-store"});
+    const data=await response.json();
+    if(!response.ok)throw new Error(data.error||"Error");
+    currentUrl=data.url;
+    get("url").textContent=data.url;
+    get("folder").textContent=data.folder;
+    get("status").textContent=data.running?"Activo":"Detenido";
+    get("dot").classList.toggle("active",data.running);
+    get("start").disabled=data.running;
+    get("stop").disabled=!data.running;
+    get("browserButton").disabled=!data.running;
+
+    if(data.running){
+      get("code").textContent=data.code.slice(0,3)+" "+data.code.slice(3);
+      get("countdown").textContent="Cambia en "+data.remaining+" s · la sesión iniciada permanece activa";
+    }else{
+      get("code").textContent="--- ---";
+      get("countdown").textContent="Servidor detenido";
+    }
+  }catch(error){
+    show(error.message,true);
+  }
+}
+
+function show(text,error){
+  get("message").textContent=text||"";
+  get("message").className="message"+(error?" error":"");
+}
+
+async function action(path){
+  show("",false);
+  const response=await fetch(path,{method:"POST",headers:headers});
+  const data=await response.json();
+  if(!response.ok)throw new Error(data.error||"Error");
+  await status();
+  return data;
+}
+
+get("start").addEventListener("click",async()=>{
+  try{await action("/api/start");}catch(error){show(error.message,true);}
+});
+get("stop").addEventListener("click",async()=>{
+  try{await action("/api/stop");}catch(error){show(error.message,true);}
+});
+get("folderButton").addEventListener("click",async()=>{
+  try{
+    const data=await action("/api/open-folder");
+    show(data.message||"Carpeta abierta",false);
+  }catch(error){show(error.message,true);}
+});
+get("browserButton").addEventListener("click",()=>{
+  if(currentUrl)window.open(currentUrl,"_blank","noopener");
+});
+
+status();
+setInterval(status,500);
+</script>
+</body>
+</html>'''.replace("__CONTROL_TOKEN__", control_token)
+
+            body = page.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.add_headers()
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):
+            if not self.authorized():
+                self.send_json({"ok": False, "error": "No autorizado"}, 403)
+                return
+
+            path = urllib.parse.urlsplit(self.path).path
+
+            if path == "/api/start":
+                ok, error = start_share()
+                if not ok:
+                    self.send_json({"ok": False, "error": error}, 500)
+                    return
+                self.send_json({"ok": True})
+                return
+
+            if path == "/api/stop":
+                threading.Thread(
+                    target=stop_share,
+                    daemon=True,
+                    name="simple-share-stop",
+                ).start()
+                self.send_json({"ok": True})
+                return
+
+            if path == "/api/open-folder":
+                try:
+                    open_shared_folder()
+                except Exception as exc:
+                    self.send_json({"ok": False, "error": str(exc)}, 500)
+                    return
+                self.send_json({"ok": True, "message": "Carpeta abierta"})
+                return
+
+            self.send_error(404)
+
+    try:
+        control_server = ThreadingHTTPServer(("127.0.0.1", 0), ControlHandler)
+    except OSError as exc:
+        print(f"No se pudo iniciar el panel de control: {exc}")
+        return 1
+
+    control_port = control_server.server_address[1]
+    control_url = f"http://127.0.0.1:{control_port}/"
+
+    print()
+    print("Simple Share 2.5 · Panel web")
+    print("============================")
+    print(f"Panel local:  {control_url}")
+    print(f"Carpeta:      {ROOT}")
+    print(f"Servidor LAN: {share_url}")
+    print("El panel solo escucha en 127.0.0.1.")
+    print("Ctrl+C para cerrar el panel.")
+    print()
+
+    webbrowser.open(control_url)
+
+    try:
+        control_server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nPanel cerrado.")
+    finally:
+        stop_share()
+        control_server.server_close()
+
+    return 0
 
 
 def run_gui(args):
@@ -1566,6 +1890,11 @@ def build_parser():
         action="store_true",
         help="Abrir la interfaz gráfica de control",
     )
+    parser.add_argument(
+        "--web-gui",
+        action="store_true",
+        help="Forzar el panel de control web local",
+    )
 
     return parser
 
@@ -1574,8 +1903,13 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
 
+    if args.web_gui:
+        return run_web_gui(args)
+
     if args.gui:
-        return run_gui(args)
+        if os.name == "nt":
+            return run_gui(args)
+        return run_web_gui(args)
 
     try:
         run_cli(args)
