@@ -3,6 +3,7 @@
 
 
 import argparse
+from collections import deque
 import html
 import hmac
 import ipaddress
@@ -11,6 +12,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -20,6 +22,7 @@ import threading
 import textwrap
 import time
 import urllib.parse
+import unicodedata
 import uuid
 import webbrowser
 from http.cookies import SimpleCookie
@@ -46,6 +49,7 @@ AUTH_LOCK = threading.Lock()
 REQUEST_LOGGER = logging.getLogger("simple_share.requests")
 REQUEST_LOG_PATH: Path | None = None
 CONSOLE_LOCK = threading.RLock()
+FILE_OP_LOCK = threading.Lock()
 CONSOLE_DASHBOARD = None
 
 
@@ -58,43 +62,58 @@ def script_directory() -> Path:
     return Path(__file__).resolve().parent
 
 
-def terminal_width() -> int:
-    """
-    Devuelve el ancho seguro de dibujo.
+def terminal_size() -> tuple[int, int]:
+    size = shutil.get_terminal_size(fallback=(100, 24))
+    # Avoid the final column/row, which may trigger terminal wrapping.
+    return max(1, size.columns - 1), max(1, size.lines - 1)
 
-    La altura no condiciona el layout. Reservamos una columna para evitar
-    el wrap automático de algunos terminales en la última celda.
-    """
-    columns = shutil.get_terminal_size(fallback=(100, 24)).columns
-    return max(1, columns - 1)
+
+def cell_width(value: str) -> int:
+    return sum(
+        0 if unicodedata.combining(char) else
+        2 if unicodedata.east_asian_width(char) in "WF" else 1
+        for char in value
+    )
+
+
+def take_cells(value: str, width: int) -> str:
+    result = []
+    used = 0
+    for char in value:
+        size = cell_width(char)
+        if used + size > width:
+            break
+        result.append(char)
+        used += size
+    return "".join(result)
 
 
 def shorten_middle(value: str, max_width: int) -> str:
-    """Acorta texto largo conservando el principio y el final."""
     if max_width <= 0:
         return ""
-    if len(value) <= max_width:
+    if cell_width(value) <= max_width:
         return value
     if max_width == 1:
         return "…"
-    if max_width <= 3:
-        return value[:max_width]
-
-    available = max_width - 1
-    left = (available + 1) // 2
-    right = available - left
-    return f"{value[:left]}…{value[-right:] if right else ''}"
+    left_width = max_width // 2
+    right_width = max_width - left_width - 1
+    return take_cells(value, left_width) + "…" + take_cells(value[::-1], right_width)[::-1]
 
 
 def shorten_end(value: str, max_width: int) -> str:
-    """Acorta texto normal por el final."""
     if max_width <= 0:
         return ""
-    if len(value) <= max_width:
+    if cell_width(value) <= max_width:
         return value
     if max_width == 1:
         return "…"
-    return value[:max_width - 1] + "…"
+    return take_cells(value, max_width - 1) + "…"
+
+
+def console_text(value: object) -> str:
+    """Keep names and paths from injecting control sequences into a terminal."""
+    return "".join(char if unicodedata.category(char)[0] != "C" else "?"
+                   for char in str(value))
 
 
 def supports_console_hyperlinks() -> bool:
@@ -124,7 +143,7 @@ def current_console_status(max_width: int) -> str:
     ]
 
     for text in variants:
-        if len(text) <= max_width:
+        if cell_width(text) <= max_width:
             return text
 
     return shorten_end(code, max_width)
@@ -140,7 +159,7 @@ def normalize_console_rows(rows):
         else:
             label, value, target = row
 
-        normalized.append((str(label), str(value), target))
+        normalized.append((console_text(label), console_text(value), target))
 
     return normalized
 
@@ -176,10 +195,10 @@ def build_console_grid(rows, max_width: int, title: str) -> list[str]:
     if max_width < 18:
         return [shorten_end(title, max_width)]
 
-    desired_label_width = max(len(label) for label, _, _ in normalized)
-    desired_value_width = max(len(value) for _, value, _ in normalized)
+    desired_label_width = max(cell_width(label) for label, _, _ in normalized)
+    desired_value_width = max(cell_width(value) for _, value, _ in normalized)
     natural_width = max(
-        len(title) + 4,
+        cell_width(title) + 4,
         desired_label_width + desired_value_width + 7,
     )
     table_width = min(max_width, natural_width)
@@ -227,8 +246,8 @@ def build_console_grid(rows, max_width: int, title: str) -> list[str]:
         zip(normalized, visible_labels, visible_values)
     ):
         linked = console_hyperlink(value, target)
-        label_padding = " " * (label_width - len(label))
-        value_padding = " " * (value_width - len(value))
+        label_padding = " " * (label_width - cell_width(label))
+        value_padding = " " * (value_width - cell_width(value))
 
         lines.append(
             f"│ {label}{label_padding} │ "
@@ -256,11 +275,11 @@ def build_compact_rows(rows, max_width: int) -> list[str]:
         label = short_labels.get(label, label)
         prefix = f"{label}: "
 
-        if len(prefix) >= max_width:
+        if cell_width(prefix) >= max_width:
             lines.append(shorten_end(label, max_width))
             continue
 
-        visible = shorten_middle(value, max_width - len(prefix))
+        visible = shorten_middle(value, max_width - cell_width(prefix))
         lines.append(prefix + console_hyperlink(visible, target))
 
     return lines
@@ -280,7 +299,7 @@ def build_explanation_lines(max_width: int) -> list[str]:
         wrapped = textwrap.wrap(
             message,
             width=max_width,
-            break_long_words=False,
+            break_long_words=True,
             break_on_hyphens=False,
         )
         lines.extend(wrapped or [""])
@@ -288,110 +307,102 @@ def build_explanation_lines(max_width: int) -> list[str]:
     return lines
 
 
-def build_console_dashboard(rows, width: int) -> list[str]:
-    """
-    Construye el dashboard completo para el ancho disponible.
-
-    El ancho es responsivo; la altura de la terminal no altera el contenido.
-    """
+def build_console_dashboard(rows, width: int, height: int | None = None) -> list[str]:
+    """Fit the dashboard to the current terminal width and height."""
     title = f"{APP_NAME} {APP_VERSION}"
     status = current_console_status(width)
-
+    main = (build_compact_rows(rows, width) if width < 18
+            else build_console_grid(rows, width, title))
     if width < 18:
-        main = [
-            shorten_end(title, width),
-            *build_compact_rows(rows, width),
-        ]
-    else:
-        main = build_console_grid(rows, width, title)
+        main.insert(0, shorten_end(title, width))
 
-    return [
-        *main,
-        "",
-        *build_explanation_lines(width),
-        "",
-        status,
-    ]
+    if height is None:
+        height = terminal_size()[1]
+    if height < len(main) + 2:
+        main = [shorten_end(title, width), *build_compact_rows(rows, width)]
+    if height <= len(main):
+        if height == 1:
+            return [status]
+        compact = build_compact_rows(rows, width)
+        normalized = normalize_console_rows(rows)
+        lan = next((line for row, line in zip(normalized, compact)
+                    if row[0] == "Red local"), "")
+        others = [line for row, line in zip(normalized, compact)
+                  if row[0] != "Red local"]
+        if height == 2:
+            return [lan or shorten_end(title, width), status]
+        main = [shorten_end(title, width), lan, *others]
+        return [*main[:height - 1], status]
+
+    available = height - len(main) - 1
+    extras = build_explanation_lines(width)
+    if available >= len(extras) + 2:
+        return [*main, "", *extras, "", status]
+    if available >= 2:
+        return [*main, "", shorten_end("Ctrl+C: detener.", width), status]
+    return [*main, status]
 
 
 class ConsoleDashboard:
-    """Dashboard responsivo únicamente al ancho de la terminal."""
+    """Keep one live dashboard inside the terminal's alternate screen."""
 
     def __init__(self, rows):
         self.rows = rows
         self.active = False
-        self.rendered_lines = 0
-        self.last_width: int | None = None
+        self.screen_active = False
+        self.last_size: tuple[int, int] | None = None
         self.last_status = ""
-        self.dynamic = bool(sys.stdout is not None and sys.stdout.isatty())
+        self.messages = deque(maxlen=50)
+        self.dynamic = bool(
+            sys.stdout is not None and sys.stdout.isatty()
+            and os.environ.get("TERM", "").lower() != "dumb"
+        )
 
-    def _width(self) -> int:
-        return terminal_width()
+    def _lines(self, size: tuple[int, int]) -> list[str]:
+        width, height = size
+        visible = min(len(self.messages), 3, max(0, height - 4))
+        dashboard = build_console_dashboard(self.rows, width, height - visible)
+        if not visible:
+            return dashboard
+        events = [shorten_end(message, width)
+                  for message in list(self.messages)[-visible:]]
+        return [*dashboard[:-1], *events, dashboard[-1]]
 
-    def _lines(self, width: int) -> list[str]:
-        return build_console_dashboard(self.rows, width)
-
-    def _erase_unlocked(self):
-        if not self.dynamic or self.rendered_lines <= 0 or sys.stdout is None:
-            return
-
-        for index in range(self.rendered_lines):
-            sys.stdout.write("\r\033[2K")
-            if index < self.rendered_lines - 1:
-                sys.stdout.write("\033[1A")
-
-        sys.stdout.flush()
-        self.rendered_lines = 0
-
-    def _render_full_unlocked(
-        self,
-        width: int | None = None,
-        clear_screen: bool = False,
-    ):
+    def _render_full_unlocked(self, size: tuple[int, int] | None = None):
         if sys.stdout is None:
             return
-
-        width = width or self._width()
-        lines = self._lines(width)
-
+        size = size or terminal_size()
+        lines = self._lines(size)
         if self.dynamic:
-            if clear_screen:
-                # El cambio de ancho puede refluir las líneas anteriores.
-                sys.stdout.write("\033[2J\033[H")
-                self.rendered_lines = 0
-            else:
-                self._erase_unlocked()
-
-            sys.stdout.write("\n".join(lines))
-            sys.stdout.flush()
-            self.rendered_lines = len(lines)
+            # Home + clear targets the same viewport after terminal reflow.
+            sys.stdout.write("\033[H\033[2J" + "\n".join(lines))
         else:
             sys.stdout.write("\n".join(lines) + "\n")
-            sys.stdout.flush()
-
-        self.last_width = width
+        sys.stdout.flush()
+        self.last_size = size
         self.last_status = lines[-1] if lines else ""
 
     def start(self):
         with CONSOLE_LOCK:
+            if self.active:
+                return
             self.active = True
+            if self.dynamic and sys.stdout is not None:
+                # The primary screen and its scrollback stay untouched.
+                sys.stdout.write("\033[?1049h\033[?25l")
+                sys.stdout.flush()
+                self.screen_active = True
             self._render_full_unlocked()
 
     def refresh(self):
         if not self.active or not self.dynamic or sys.stdout is None:
             return
-
         with CONSOLE_LOCK:
-            width = self._width()
-
-            # Solo el ancho provoca una reconstrucción completa.
-            if width != self.last_width:
-                self._render_full_unlocked(width, clear_screen=True)
+            size = terminal_size()
+            if size != self.last_size:
+                self._render_full_unlocked(size)
                 return
-
-            status = current_console_status(width)
-
-            # Sin resize solo cambia la última línea: evitamos parpadeos.
+            status = current_console_status(size[0])
             if status != self.last_status:
                 sys.stdout.write("\r\033[2K" + status)
                 sys.stdout.flush()
@@ -400,27 +411,23 @@ class ConsoleDashboard:
     def write_log(self, message: str):
         if sys.stdout is None:
             return
-
+        message = console_text(message)
         with CONSOLE_LOCK:
             if not self.active or not self.dynamic:
                 sys.stdout.write(message + "\n")
                 sys.stdout.flush()
                 return
-
-            self._erase_unlocked()
-            sys.stdout.write(message + "\n")
-            sys.stdout.flush()
-            self.last_width = None
-            self.last_status = ""
+            self.messages.append(message)
             self._render_full_unlocked()
 
     def stop(self):
         with CONSOLE_LOCK:
-            if self.dynamic:
-                self._erase_unlocked()
-
+            if self.screen_active and sys.stdout is not None:
+                sys.stdout.write("\033[?25h\033[?1049l")
+                sys.stdout.flush()
+                self.screen_active = False
             self.active = False
-            self.last_width = None
+            self.last_size = None
             self.last_status = ""
 
 
@@ -441,6 +448,20 @@ class StatusAwareConsoleHandler(logging.StreamHandler):
             self.handleError(record)
 
 
+
+def console_event(message: str):
+    """Serialize file events with dashboard updates from other threads."""
+    message = console_text(message)
+    dashboard = CONSOLE_DASHBOARD
+    if dashboard is not None:
+        dashboard.write_log(message)
+    elif sys.stdout is not None:
+        with CONSOLE_LOCK:
+            sys.stdout.write(message + "\n")
+            sys.stdout.flush()
+
+
+
 def configure_request_logging(verbose: bool = False) -> Path:
     global REQUEST_LOG_PATH
 
@@ -449,7 +470,9 @@ def configure_request_logging(verbose: bool = False) -> Path:
 
     REQUEST_LOG_PATH = log_dir / f"simple_share_{datetime.now():%Y-%m-%d}.log"
 
-    REQUEST_LOGGER.handlers.clear()
+    for handler in REQUEST_LOGGER.handlers[:]:
+        REQUEST_LOGGER.removeHandler(handler)
+        handler.close()
     REQUEST_LOGGER.setLevel(logging.INFO)
     REQUEST_LOGGER.propagate = False
 
@@ -490,14 +513,21 @@ def require_root() -> Path:
 
 
 def safe_path(relative_path: str) -> Path:
-    """Convierte una ruta relativa en una ruta segura dentro de ROOT."""
+    """Resolve a relative path inside ROOT, rejecting every symlink component."""
     root = require_root()
-    relative_path = urllib.parse.unquote(relative_path or "").lstrip("/")
-    candidate = (root / relative_path).resolve()
-
+    if not isinstance(relative_path, str) or "\x00" in relative_path:
+        raise ValueError("Ruta no válida")
+    parts = Path(relative_path).parts
+    if Path(relative_path).is_absolute():
+        raise ValueError("Ruta absoluta no permitida")
+    current = root
+    for part in parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError("Enlaces simbólicos no permitidos")
+    candidate = current.resolve()
     if candidate != root and root not in candidate.parents:
         raise ValueError("Ruta fuera de la carpeta compartida")
-
     return candidate
 
 
@@ -516,7 +546,8 @@ def valid_name(name: str) -> bool:
     if not name or name in (".", ".."):
         return False
 
-    if any(ch in name for ch in ("/", "\\", "\x00")):
+    if (any(ch in name for ch in ("/", "\\")) or
+            any(unicodedata.category(ch)[0] == "C" for ch in name)):
         return False
 
     # Windows no admite estos caracteres en nombres de archivo.
@@ -530,7 +561,7 @@ def unique_path(directory: Path, name: str) -> Path:
     """Devuelve una ruta que no colisiona con una existente."""
     target = directory / name
 
-    if not target.exists():
+    if not target.exists() and not target.is_symlink():
         return target
 
     original = Path(name)
@@ -540,7 +571,7 @@ def unique_path(directory: Path, name: str) -> Path:
 
     while True:
         candidate = directory / f"{stem} ({counter}){suffix}"
-        if not candidate.exists():
+        if not candidate.exists() and not candidate.is_symlink():
             return candidate
         counter += 1
 
@@ -602,7 +633,7 @@ def console_dashboard_loop(
     dashboard.start()
 
     try:
-        while not stop_event.wait(0.25):
+        while not stop_event.wait(0.1):
             dashboard.refresh()
     finally:
         dashboard.stop()
@@ -678,7 +709,7 @@ class ShareHandler(BaseHTTPRequestHandler):
         REQUEST_LOGGER.info(
             "[%s] %s",
             self.address_string(),
-            fmt % args,
+            console_text(fmt % args),
         )
 
     # --------------------------------------------------------
@@ -700,8 +731,14 @@ class ShareHandler(BaseHTTPRequestHandler):
         return bool(value) and hmac.compare_digest(value, ACCESS_TOKEN)
 
     def is_authenticated(self) -> bool:
-        # El propio equipo puede acceder por localhost sin OTP.
-        if is_loopback_address(self.client_address[0]):
+        host = self.headers.get("Host", "")
+        try:
+            hostname = urllib.parse.urlsplit("http://" + host).hostname
+        except ValueError:
+            hostname = None
+        if (is_loopback_address(self.client_address[0]) and
+                (hostname == "localhost" or
+                 (hostname is not None and is_loopback_address(hostname)))):
             return True
 
         raw_cookie = self.headers.get("Cookie", "")
@@ -879,7 +916,7 @@ class ShareHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            path = safe_path(parsed.path)
+            path = safe_path(urllib.parse.unquote(parsed.path).lstrip("/"))
         except ValueError:
             self.send_error(403, "Ruta no permitida")
             return
@@ -945,6 +982,13 @@ class ShareHandler(BaseHTTPRequestHandler):
             raise ValueError("Se esperaba un objeto JSON")
 
         return data
+
+    def request_json(self):
+        try:
+            return self.read_json()
+        except ValueError as exc:
+            self.api_error(400, str(exc))
+            return None
 
     def send_json(self, data, status=200):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
@@ -1044,6 +1088,7 @@ class ShareHandler(BaseHTTPRequestHandler):
             self.api_error(400, "Nombre de archivo no válido")
             return
 
+        filename = filename.strip()
         directory = self.get_existing_directory(directory_name)
         if directory is None:
             return
@@ -1071,7 +1116,6 @@ class ShareHandler(BaseHTTPRequestHandler):
             )
             return
 
-        target = unique_path(directory, filename)
         temp = directory / f".upload-{uuid.uuid4().hex}.part"
         remaining = length
 
@@ -1086,7 +1130,9 @@ class ShareHandler(BaseHTTPRequestHandler):
                     output.write(chunk)
                     remaining -= len(chunk)
 
-            os.replace(temp, target)
+            with FILE_OP_LOCK:
+                target = unique_path(directory, filename)
+                os.replace(temp, target)
 
         except Exception as exc:
             try:
@@ -1094,11 +1140,11 @@ class ShareHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-            print(f"Error subiendo {filename}: {exc}")
+            console_event(f"Error subiendo {filename}: {exc}")
             self.api_error(500, "Error guardando el archivo")
             return
 
-        print(
+        console_event(
             f"↑ SUBIDO: {relative_path(target)} "
             f"({human_size(length)})"
         )
@@ -1117,10 +1163,8 @@ class ShareHandler(BaseHTTPRequestHandler):
     # --------------------------------------------------------
 
     def handle_mkdir(self):
-        try:
-            data = self.read_json()
-        except ValueError as exc:
-            self.api_error(400, str(exc))
+        data = self.request_json()
+        if data is None:
             return
 
         directory = self.get_existing_directory(data.get("dir", ""))
@@ -1145,7 +1189,7 @@ class ShareHandler(BaseHTTPRequestHandler):
             self.api_error(500, f"No se pudo crear la carpeta: {exc}")
             return
 
-        print(f"+ CARPETA: {relative_path(target)}")
+        console_event(f"+ CARPETA: {relative_path(target)}")
         self.send_json({"ok": True, "path": relative_path(target)})
 
     # --------------------------------------------------------
@@ -1153,10 +1197,8 @@ class ShareHandler(BaseHTTPRequestHandler):
     # --------------------------------------------------------
 
     def handle_move(self):
-        try:
-            data = self.read_json()
-        except ValueError as exc:
-            self.api_error(400, str(exc))
+        data = self.request_json()
+        if data is None:
             return
 
         source = self.get_existing_source(data.get("source"))
@@ -1183,7 +1225,7 @@ class ShareHandler(BaseHTTPRequestHandler):
             self.api_error(500, f"No se pudo mover: {exc}")
             return
 
-        print(f"→ MOVIDO: {relative_path(source)} -> {relative_path(moved)}")
+        console_event(f"→ MOVIDO: {relative_path(source)} -> {relative_path(moved)}")
         self.send_json({"ok": True, "path": relative_path(moved)})
 
     # --------------------------------------------------------
@@ -1191,10 +1233,8 @@ class ShareHandler(BaseHTTPRequestHandler):
     # --------------------------------------------------------
 
     def handle_copy(self):
-        try:
-            data = self.read_json()
-        except ValueError as exc:
-            self.api_error(400, str(exc))
+        data = self.request_json()
+        if data is None:
             return
 
         source = self.get_existing_source(data.get("source"))
@@ -1213,14 +1253,14 @@ class ShareHandler(BaseHTTPRequestHandler):
 
         try:
             if source.is_dir():
-                shutil.copytree(source, target)
+                shutil.copytree(source, target, symlinks=True)
             else:
                 shutil.copy2(source, target)
         except OSError as exc:
             self.api_error(500, f"No se pudo copiar: {exc}")
             return
 
-        print(f"⧉ COPIADO: {relative_path(source)} -> {relative_path(target)}")
+        console_event(f"⧉ COPIADO: {relative_path(source)} -> {relative_path(target)}")
         self.send_json({"ok": True, "path": relative_path(target)})
 
     # --------------------------------------------------------
@@ -1228,10 +1268,8 @@ class ShareHandler(BaseHTTPRequestHandler):
     # --------------------------------------------------------
 
     def handle_rename(self):
-        try:
-            data = self.read_json()
-        except ValueError as exc:
-            self.api_error(400, str(exc))
+        data = self.request_json()
+        if data is None:
             return
 
         source = self.get_existing_source(data.get("source"))
@@ -1261,7 +1299,7 @@ class ShareHandler(BaseHTTPRequestHandler):
             self.api_error(500, f"No se pudo renombrar: {exc}")
             return
 
-        print(f"✎ RENOMBRADO: {relative_path(source)} -> {relative_path(renamed)}")
+        console_event(f"✎ RENOMBRADO: {relative_path(source)} -> {relative_path(renamed)}")
         self.send_json({"ok": True, "path": relative_path(renamed)})
 
     # --------------------------------------------------------
@@ -1269,10 +1307,8 @@ class ShareHandler(BaseHTTPRequestHandler):
     # --------------------------------------------------------
 
     def handle_delete(self):
-        try:
-            data = self.read_json()
-        except ValueError as exc:
-            self.api_error(400, str(exc))
+        data = self.request_json()
+        if data is None:
             return
 
         source = self.get_existing_source(data.get("source"))
@@ -1290,7 +1326,7 @@ class ShareHandler(BaseHTTPRequestHandler):
             self.api_error(500, f"No se pudo eliminar: {exc}")
             return
 
-        print(f"× ELIMINADO: {old_path}")
+        console_event(f"× ELIMINADO: {old_path}")
         self.send_json({"ok": True})
 
     # --------------------------------------------------------
@@ -1299,31 +1335,34 @@ class ShareHandler(BaseHTTPRequestHandler):
 
     def send_file(self, path: Path):
         try:
-            size = path.stat().st_size
-            content_type, _ = mimetypes.guess_type(path.name)
-            content_type = content_type or "application/octet-stream"
-            encoded_filename = urllib.parse.quote(path.name)
+            file = open(path, "rb")
+        except OSError:
+            self.send_error(403, "No se puede leer el archivo")
+            return
 
-            self.send_response(200)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(size))
-            self.send_header(
-                "Content-Disposition",
-                f"attachment; filename*=UTF-8''{encoded_filename}",
-            )
-            self.send_header("Cache-Control", "no-store")
-            self.add_security_headers()
-            self.end_headers()
+        try:
+            with file:
+                size = os.fstat(file.fileno()).st_size
+                content_type, _ = mimetypes.guess_type(path.name)
+                encoded_filename = urllib.parse.quote(path.name)
 
-            with open(path, "rb") as file:
+                self.send_response(200)
+                self.send_header("Content-Type", content_type or "application/octet-stream")
+                self.send_header("Content-Length", str(size))
+                self.send_header(
+                    "Content-Disposition",
+                    f"attachment; filename*=UTF-8''{encoded_filename}",
+                )
+                self.send_header("Cache-Control", "no-store")
+                self.add_security_headers()
+                self.end_headers()
                 shutil.copyfileobj(file, self.wfile, length=1024 * 1024)
 
-            print(f"↓ DESCARGADO: {relative_path(path)} ({human_size(size)})")
-
+            console_event(f"↓ DESCARGADO: {relative_path(path)} ({human_size(size)})")
         except (BrokenPipeError, ConnectionResetError):
             pass
         except OSError as exc:
-            print(f"Error enviando {path}: {exc}")
+            console_event(f"Error enviando {path}: {exc}")
 
     # --------------------------------------------------------
     # Interfaz web
@@ -1431,7 +1470,8 @@ class ShareHandler(BaseHTTPRequestHandler):
         if visible == 0:
             rows.append('<div class="empty">Esta carpeta está vacía</div>')
 
-        current_dir_json = json.dumps(rel_dir)
+        # JSON inside <script> must not contain a literal closing script tag.
+        current_dir_json = json.dumps(rel_dir).replace("<", "\\u003c")
         display_path = "/" if not rel_dir else "/" + html.escape(rel_dir)
 
         page = r'''<!doctype html>
@@ -1504,8 +1544,8 @@ function openDelete(){const what=selectedItem.kind==="folder"?"La carpeta y todo
             "__TRASH_ICON__": svg_icon("trash", "button-icon"),
             "__SELECT_ALL_ICON__": svg_icon("select-all", "button-icon"),
         }
-        for token, value in replacements.items():
-            page = page.replace(token, value)
+        pattern = re.compile("|".join(re.escape(token) for token in replacements))
+        page = pattern.sub(lambda match: replacements[match.group()], page)
 
         body = page.encode("utf-8")
         self.send_response(200)
@@ -1545,6 +1585,8 @@ def configure_runtime(args):
 
     if args.max_upload_mb <= 0:
         raise RuntimeError("--max-upload-mb debe ser mayor que 0")
+    if not 1 <= args.port <= 65535:
+        raise RuntimeError("--port debe estar entre 1 y 65535")
 
     MAX_UPLOAD_BYTES = args.max_upload_mb * 1024 * 1024
 
@@ -1623,7 +1665,7 @@ def run_cli(args):
     dashboard_thread.start()
 
     try:
-        server.serve_forever()
+        server.serve_forever(poll_interval=0.1)
     except KeyboardInterrupt:
         pass
     finally:
@@ -1664,6 +1706,7 @@ def run_web_gui(args):
 
             thread = threading.Thread(
                 target=server.serve_forever,
+                kwargs={"poll_interval": 0.1},
                 daemon=True,
                 name="simple-share-http",
             )
@@ -1675,16 +1718,14 @@ def run_web_gui(args):
     def stop_share():
         with state_lock:
             server = state["server"]
-            state["server"] = None
-            state["thread"] = None
-
-        if server is None:
-            return
-
-        try:
-            server.shutdown()
-        finally:
-            server.server_close()
+            if server is None:
+                return
+            try:
+                server.shutdown()
+            finally:
+                server.server_close()
+                state["server"] = None
+                state["thread"] = None
 
     class ControlHandler(BaseHTTPRequestHandler):
         server_version = "SimpleShareControl/1.0"
@@ -1704,9 +1745,16 @@ def run_web_gui(args):
                 "base-uri 'none'; frame-ancestors 'none'",
             )
 
+        def valid_host(self):
+            # Prevent DNS rebinding from reading the panel's embedded token.
+            return self.headers.get("Host") == f"127.0.0.1:{self.server.server_port}"
+
         def authorized(self):
             supplied = self.headers.get("X-Simple-Share-Control", "")
-            return hmac.compare_digest(supplied, control_token)
+            origin = self.headers.get("Origin")
+            return (self.valid_host() and
+                    (origin is None or origin == f"http://{self.headers['Host']}") and
+                    hmac.compare_digest(supplied, control_token))
 
         def send_json(self, data, status=200):
             body = json.dumps(data, ensure_ascii=False).encode("utf-8")
@@ -1719,6 +1767,9 @@ def run_web_gui(args):
             self.wfile.write(body)
 
         def do_GET(self):
+            if not self.valid_host():
+                self.send_error(403)
+                return
             path = urllib.parse.urlsplit(self.path).path
 
             if path == "/favicon.ico":
@@ -1878,7 +1929,7 @@ get("browserButton").addEventListener("click",()=>{
 });
 
 status();
-setInterval(status,500);
+setInterval(status,1000);
 </script>
 </body>
 </html>'''.replace("__CONTROL_TOKEN__", control_token)
@@ -1908,11 +1959,7 @@ setInterval(status,500);
                 return
 
             if path == "/api/stop":
-                threading.Thread(
-                    target=stop_share,
-                    daemon=True,
-                    name="simple-share-stop",
-                ).start()
+                stop_share()
                 self.send_json({"ok": True})
                 return
 
@@ -1949,7 +1996,7 @@ setInterval(status,500);
     webbrowser.open(control_url)
 
     try:
-        control_server.serve_forever()
+        control_server.serve_forever(poll_interval=0.1)
     except KeyboardInterrupt:
         print("\nPanel cerrado.")
     finally:
@@ -1963,8 +2010,8 @@ def run_gui(args):
     try:
         import tkinter as tk
         from tkinter import messagebox
-    except ImportError:
-        print("Tkinter no está disponible; abriendo el panel web local.")
+    except Exception as exc:
+        print(f"Tkinter no está disponible ({exc}); abriendo el panel web local.")
         return run_web_gui(args)
 
     try:
@@ -1978,6 +2025,129 @@ def run_gui(args):
         except Exception:
             print(exc)
         return 1
+
+    def rounded_shape(canvas, width, height, radius, fill, outline=""):
+        """Draw a rounded panel using the curved polygon supported by Tk Canvas."""
+        x1, y1, x2, y2 = 1, 1, max(2, width - 1), max(2, height - 1)
+        r = min(radius, (x2 - x1) / 2, (y2 - y1) / 2)
+        points = [
+            x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r,
+            x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2,
+            x1, y2, x1, y2 - r, x1, y1 + r, x1, y1,
+        ]
+        return canvas.create_polygon(
+            points, smooth=True, splinesteps=16, fill=fill,
+            outline=outline, width=1,
+        )
+
+    class RoundedButton(tk.Canvas):
+        def __init__(self, parent, text, command, normal, hover):
+            super().__init__(
+                parent, width=170, height=46, bg=parent["bg"],
+                highlightthickness=0, bd=0, takefocus=1, cursor="hand2",
+            )
+            self.label = text
+            self.command = command
+            self.normal = normal
+            self.hover = hover
+            self.enabled = True
+            self.hovered = False
+            self.focused = False
+            self.bind("<Configure>", self.draw)
+            self.bind("<Enter>", self.on_enter)
+            self.bind("<Leave>", self.on_leave)
+            self.bind("<FocusIn>", self.on_focus)
+            self.bind("<FocusOut>", self.on_blur)
+            self.bind("<Button-1>", self.activate)
+            self.bind("<Return>", self.activate)
+            self.bind("<space>", self.activate)
+
+        def set_enabled(self, enabled):
+            self.enabled = enabled
+            self.configure(cursor="hand2" if enabled else "arrow")
+            self.draw()
+
+        def on_enter(self, _event):
+            self.hovered = True
+            self.draw()
+
+        def on_leave(self, _event):
+            self.hovered = False
+            self.draw()
+
+        def on_focus(self, _event):
+            self.focused = True
+            self.draw()
+
+        def on_blur(self, _event):
+            self.focused = False
+            self.draw()
+
+        def activate(self, _event):
+            if self.enabled:
+                self.focus_set()
+                self.command()
+
+        def draw(self, _event=None):
+            width, height = self.winfo_width(), self.winfo_height()
+            if width < 5 or height < 5:
+                return
+            self.delete("all")
+            fill = self.hover if self.hovered and self.enabled else self.normal
+            rounded_shape(
+                self, width, height, 10, fill,
+                "#93c5fd" if self.focused else "",
+            )
+            self.create_text(
+                width / 2, height / 2, text=self.label,
+                fill="white" if self.enabled else "#9ca3af",
+                font=("Segoe UI", 10, "bold"),
+            )
+
+    class RoundedReadOnlyField(tk.Canvas):
+        """A selectable Entry inset inside a rounded Canvas surface."""
+
+        def __init__(self, parent, variable, fill, border, foreground):
+            super().__init__(
+                parent, width=430, height=38, bg=parent["bg"],
+                highlightthickness=0, bd=0,
+            )
+            self.fill = fill
+            self.border = border
+            self.focused = False
+            self.entry = tk.Entry(
+                self, textvariable=variable, state="readonly",
+                readonlybackground=fill, bg=fill, fg=foreground,
+                relief="flat", bd=0, highlightthickness=0,
+                font=("Consolas", 10),
+            )
+            self.entry_window = self.create_window(
+                14, 19, anchor="w", window=self.entry,
+            )
+            self.bind("<Configure>", self.draw)
+            self.entry.bind("<FocusIn>", self.on_focus)
+            self.entry.bind("<FocusOut>", self.on_blur)
+
+        def on_focus(self, _event):
+            self.focused = True
+            self.draw()
+
+        def on_blur(self, _event):
+            self.focused = False
+            self.draw()
+
+        def draw(self, _event=None):
+            width, height = self.winfo_width(), self.winfo_height()
+            if width < 5 or height < 5:
+                return
+            self.delete("field-background")
+            shape = rounded_shape(
+                self, width, height, 10, self.fill,
+                "#93c5fd" if self.focused else self.border,
+            )
+            self.addtag_withtag("field-background", shape)
+            self.tag_lower(shape)
+            self.itemconfigure(self.entry_window, width=max(1, width - 28))
 
     class SimpleShareGUI:
         BG = "#111827"
@@ -2002,15 +2172,18 @@ def run_gui(args):
             self.root.configure(bg=self.BG)
             self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-            self.status_text = tk.StringVar(value="Detenido")
             self.url_text = tk.StringVar(value=self.url)
             self.folder_text = tk.StringVar(value=str(require_root()))
             self.otp_text = tk.StringVar(value="--- ---")
             self.countdown_text = tk.StringVar(value="Servidor detenido")
 
-            self.build()
-            self.fit_window_to_content()
-            self.refresh_dynamic()
+            try:
+                self.build()
+                self.fit_window_to_content()
+                self.refresh_dynamic()
+            except Exception:
+                self.root.destroy()
+                raise
 
         def fit_window_to_content(self):
             """Ajusta la ventana al tamaño real de la interfaz y la centra."""
@@ -2025,46 +2198,21 @@ def run_gui(args):
             x = max(0, (screen_width - width) // 2)
             y = max(0, (screen_height - height) // 2)
 
+            width = min(width, screen_width)
+            height = min(height, screen_height)
             self.root.geometry(f"{width}x{height}+{x}+{y}")
-            self.root.resizable(False, False)
+            self.root.minsize(min(340, screen_width), min(height, screen_height))
+            self.root.resizable(True, False)
 
         def make_button(self, parent, text, command, primary=False):
             normal = self.PRIMARY if primary else self.SECONDARY
             hover = self.PRIMARY_HOVER if primary else self.SECONDARY_HOVER
-
-            button = tk.Button(
-                parent,
-                text=text,
-                command=command,
-                bg=normal,
-                fg="white",
-                activebackground=hover,
-                activeforeground="white",
-                disabledforeground="#6b7280",
-                relief="flat",
-                bd=0,
-                padx=16,
-                pady=12,
-                font=("Segoe UI", 10, "bold"),
-                cursor="hand2",
-            )
-
-            button.bind("<Enter>", lambda _e: button.config(bg=hover) if button["state"] == "normal" else None)
-            button.bind("<Leave>", lambda _e: button.config(bg=normal) if button["state"] == "normal" else None)
-            return button
+            return RoundedButton(parent, text, command, normal, hover)
 
         def make_readonly_entry(self, parent, variable):
-            entry = tk.Entry(
-                parent,
-                textvariable=variable,
-                state="readonly",
-                readonlybackground=self.BG,
-                fg=self.TEXT,
-                relief="flat",
-                bd=0,
-                font=("Consolas", 10),
+            return RoundedReadOnlyField(
+                parent, variable, self.PANEL, self.BORDER, self.TEXT,
             )
-            return entry
 
         def build(self):
             outer = tk.Frame(self.root, bg=self.BG, padx=24, pady=22)
@@ -2081,43 +2229,45 @@ def run_gui(args):
                 font=("Segoe UI", 20, "bold"),
             ).pack(side="left")
 
-            status_wrap = tk.Frame(header, bg=self.BG)
-            status_wrap.pack(side="right", pady=5)
-
-            self.status_dot = tk.Canvas(
-                status_wrap,
-                width=14,
-                height=14,
-                bg=self.BG,
-                highlightthickness=0,
+            self.status_pill = tk.Canvas(
+                header, width=120, height=30, bg=self.BG,
+                highlightthickness=0, bd=0,
             )
-            self.status_dot.pack(side="left", padx=(0, 7))
-            self.status_circle = self.status_dot.create_oval(
-                2, 2, 12, 12,
-                fill=self.STOPPED,
-                outline="",
+            self.status_pill.pack(side="right", pady=5)
+            self.status_pill.bind("<Configure>", self.draw_status_pill)
+            self.status_circle = self.status_pill.create_oval(
+                12, 10, 22, 20, fill=self.STOPPED, outline="",
             )
-
-            tk.Label(
-                status_wrap,
-                textvariable=self.status_text,
-                bg=self.BG,
-                fg=self.TEXT,
+            self.status_label = self.status_pill.create_text(
+                31, 15, anchor="w", text="Detenido", fill=self.TEXT,
                 font=("Segoe UI", 10, "bold"),
-            ).pack(side="left")
+            )
 
-            card = tk.Frame(
-                outer,
-                bg=self.PANEL,
-                highlightbackground=self.BORDER,
-                highlightthickness=1,
-                padx=20,
-                pady=18,
+            card = tk.Canvas(
+                outer, width=430, height=151, bg=self.BG,
+                highlightthickness=0, bd=0,
             )
             card.pack(fill="x", pady=(22, 16))
+            card_content = tk.Frame(card, bg=self.PANEL)
+            card_window = card.create_window(
+                21, 17, anchor="nw", window=card_content,
+            )
+
+            def resize_card(event):
+                card.delete("card-background")
+                shape = rounded_shape(
+                    card, event.width, event.height, 16,
+                    self.PANEL, self.BORDER,
+                )
+                card.addtag_withtag("card-background", shape)
+                card.tag_lower(shape)
+                card.itemconfigure(card_window, width=max(1, event.width - 42))
+                self.countdown_label.configure(wraplength=max(1, event.width - 60))
+
+            card.bind("<Configure>", resize_card)
 
             tk.Label(
-                card,
+                card_content,
                 text="Código de acceso",
                 bg=self.PANEL,
                 fg=self.MUTED,
@@ -2125,20 +2275,22 @@ def run_gui(args):
             ).pack()
 
             tk.Label(
-                card,
+                card_content,
                 textvariable=self.otp_text,
                 bg=self.PANEL,
                 fg=self.TEXT,
                 font=("Consolas", 28, "bold"),
             ).pack(pady=(4, 2))
 
-            tk.Label(
-                card,
+            self.countdown_label = tk.Label(
+                card_content,
                 textvariable=self.countdown_text,
                 bg=self.PANEL,
                 fg=self.MUTED,
                 font=("Segoe UI", 9),
-            ).pack()
+                justify="center",
+            )
+            self.countdown_label.pack()
 
             info = tk.Frame(outer, bg=self.BG)
             info.pack(fill="x", pady=(0, 18))
@@ -2199,6 +2351,16 @@ def run_gui(args):
 
             self.apply_state()
 
+        def draw_status_pill(self, event=None):
+            width = event.width if event else self.status_pill.winfo_width()
+            height = event.height if event else self.status_pill.winfo_height()
+            self.status_pill.delete("pill-background")
+            shape = rounded_shape(
+                self.status_pill, width, height, 14, self.PANEL, self.BORDER,
+            )
+            self.status_pill.addtag_withtag("pill-background", shape)
+            self.status_pill.tag_lower(shape)
+
         @property
         def running(self):
             return self.server is not None
@@ -2206,15 +2368,17 @@ def run_gui(args):
         def apply_state(self):
             running = self.running
 
-            self.status_text.set("Activo" if running else "Detenido")
-            self.status_dot.itemconfigure(
+            self.status_pill.itemconfigure(
+                self.status_label, text="Activo" if running else "Detenido",
+            )
+            self.status_pill.itemconfigure(
                 self.status_circle,
                 fill=self.SUCCESS if running else self.STOPPED,
             )
 
-            self.start_button.config(state="disabled" if running else "normal")
-            self.stop_button.config(state="normal" if running else "disabled")
-            self.browser_button.config(state="normal" if running else "disabled")
+            self.start_button.set_enabled(not running)
+            self.stop_button.set_enabled(running)
+            self.browser_button.set_enabled(running)
 
         def start_server(self):
             if self.running:
@@ -2229,6 +2393,7 @@ def run_gui(args):
             self.server = server
             self.server_thread = threading.Thread(
                 target=server.serve_forever,
+                kwargs={"poll_interval": 0.1},
                 daemon=True,
                 name="simple-share-http",
             )
@@ -2241,21 +2406,15 @@ def run_gui(args):
                 return
 
             server = self.server
-            self.server = None
-            self.server_thread = None
-            self.apply_state()
-            self.otp_text.set("--- ---")
-            self.countdown_text.set("Servidor detenido")
-
-            def shutdown():
+            try:
                 server.shutdown()
+            finally:
                 server.server_close()
-
-            threading.Thread(
-                target=shutdown,
-                daemon=True,
-                name="simple-share-shutdown",
-            ).start()
+                self.server = None
+                self.server_thread = None
+                self.apply_state()
+                self.otp_text.set("--- ---")
+                self.countdown_text.set("Servidor detenido")
 
         def open_folder(self):
             try:
@@ -2280,7 +2439,7 @@ def run_gui(args):
                     f"Cambia en {remaining} s · la sesión ya iniciada permanece activa"
                 )
 
-            self.root.after(250, self.refresh_dynamic)
+            self.root.after(500, self.refresh_dynamic)
 
         def on_close(self):
             if self.running:
@@ -2305,8 +2464,21 @@ def run_gui(args):
         def run(self):
             self.root.mainloop()
 
-    app = SimpleShareGUI()
-    app.run()
+    app = None
+    try:
+        app = SimpleShareGUI()
+        app.run()
+    except Exception as exc:
+        if app is not None:
+            if app.server is not None:
+                app.server.shutdown()
+                app.server.server_close()
+            try:
+                app.root.destroy()
+            except tk.TclError:
+                pass
+        print(f"No se pudo abrir la ventana Tkinter ({exc}); abriendo el panel web local.")
+        return run_web_gui(args)
     return 0
 
 
@@ -2352,9 +2524,10 @@ def build_parser():
         help="Abrir la interfaz gráfica de control",
     )
     parser.add_argument(
-        "--web-gui",
+        "--web", "--web-gui",
+        dest="web",
         action="store_true",
-        help="Forzar el panel de control web local",
+        help="Abrir el panel de control web local",
     )
     parser.add_argument(
         "-v",
@@ -2376,7 +2549,7 @@ def main():
         print(f"No se pudo crear el registro de peticiones: {exc}")
         return 1
 
-    if args.web_gui:
+    if args.web:
         return run_web_gui(args)
 
     if args.gui:
