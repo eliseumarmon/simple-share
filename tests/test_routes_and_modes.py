@@ -159,6 +159,54 @@ class RouteAndModeTests(unittest.TestCase):
                     server.server_close()
                     thread.join(timeout=2)
 
+    def test_resumable_chunked_upload(self):
+        with tempfile.TemporaryDirectory() as shared:
+            root = Path(shared)
+            with patch.object(simple_share, "ROOT", root):
+                server = simple_share.ShareServer(("127.0.0.1", 0), simple_share.ShareHandler)
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    def chunk(offset, body, upload_id="ab" * 16, total=10):
+                        query = urllib.parse.urlencode({
+                            "name": "datos.bin", "id": upload_id,
+                            "offset": offset, "total": total,
+                        })
+                        connection = http.client.HTTPConnection("127.0.0.1", server.server_port)
+                        connection.request(
+                            "POST", "/api/upload?" + query, body=body,
+                            headers={"Origin": f"http://127.0.0.1:{server.server_port}"},
+                        )
+                        response = connection.getresponse()
+                        result = response.status, json.loads(response.read())
+                        connection.close()
+                        return result
+
+                    status, data = chunk(0, b"01234")
+                    self.assertEqual((status, data["received"]), (200, 5))
+                    self.assertEqual(list(root.iterdir()), [root / f".upload-{'ab' * 16}.part"])
+
+                    # Un trozo que se adelanta a lo recibido indica desde dónde seguir.
+                    status, data = chunk(8, b"89")
+                    self.assertEqual((status, data["received"]), (409, 5))
+
+                    # Reenviar un trozo ya recibido lo sobrescribe sin duplicar datos.
+                    self.assertEqual(chunk(0, b"01234")[0], 200)
+                    status, data = chunk(5, b"56789")
+                    self.assertEqual((status, data["path"]), (200, "datos.bin"))
+                    self.assertEqual((root / "datos.bin").read_bytes(), b"0123456789")
+
+                    # Si se pierde la respuesta final, repetir no crea otra copia.
+                    status, data = chunk(5, b"56789")
+                    self.assertEqual((status, data["path"]), (200, "datos.bin"))
+                    self.assertEqual([p.name for p in root.iterdir()], ["datos.bin"])
+
+                    self.assertEqual(chunk(0, b"x", upload_id="../x")[0], 400)
+                finally:
+                    server.shutdown()
+                    server.server_close()
+                    thread.join(timeout=2)
+
     def test_web_flag_and_tk_fallback(self):
         self.assertTrue(simple_share.build_parser().parse_args(["--web"]).web)
         self.assertTrue(simple_share.build_parser().parse_args(["--web-gui"]).web)

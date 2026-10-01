@@ -50,6 +50,11 @@ REQUEST_LOGGER = logging.getLogger("simple_share.requests")
 REQUEST_LOG_PATH: Path | None = None
 CONSOLE_LOCK = threading.RLock()
 FILE_OP_LOCK = threading.Lock()
+# Subidas por trozos: id -> respuesta final, por si se pierde la confirmación.
+COMPLETED_UPLOADS: dict[str, dict] = {}
+COMPLETED_UPLOADS_MAX = 1000
+UPLOAD_ID_RE = re.compile(r"[0-9a-f]{32}")
+STALE_UPLOAD_SECONDS = 24 * 60 * 60
 CONSOLE_DASHBOARD = None
 
 
@@ -1119,6 +1124,14 @@ class ShareHandler(BaseHTTPRequestHandler):
             self.api_error(500, f"No se pudo crear la subcarpeta: {exc}")
             return
 
+        # Subida reanudable: el cliente envía el archivo por trozos con un id
+        # propio y el desplazamiento de cada trozo. Sin id, se sube de una vez.
+        upload_id = params.get("id", [""])[0]
+        resumable = bool(upload_id)
+        if resumable and not UPLOAD_ID_RE.fullmatch(upload_id):
+            self.api_error(400, "Identificador de subida no válido")
+            return
+
         raw_length = self.headers.get("Content-Length")
 
         if raw_length is None:
@@ -1127,26 +1140,68 @@ class ShareHandler(BaseHTTPRequestHandler):
 
         try:
             length = int(raw_length)
+            offset = int(params.get("offset", ["0"])[0])
+            total = int(params.get("total", [str(offset + length)])[0])
         except ValueError:
-            self.api_error(400, "Content-Length no válido")
-            return
-
-        if length < 0:
             self.api_error(400, "Tamaño de archivo no válido")
             return
 
-        if length > MAX_UPLOAD_BYTES:
+        if length < 0 or offset < 0 or offset + length > total:
+            self.api_error(400, "Tamaño de archivo no válido")
+            return
+
+        if total > MAX_UPLOAD_BYTES:
             self.api_error(
                 413,
                 f"Archivo demasiado grande. Máximo: {human_size(MAX_UPLOAD_BYTES)}",
             )
             return
 
-        temp = directory / f".upload-{uuid.uuid4().hex}.part"
+        if resumable:
+            with FILE_OP_LOCK:
+                completed = COMPLETED_UPLOADS.get(upload_id)
+            if completed is not None:
+                # El archivo ya se guardó; solo se perdió la respuesta.
+                self.discard_body(length)
+                self.send_json(completed)
+                return
+        else:
+            upload_id = uuid.uuid4().hex
+
+        temp = directory / f".upload-{upload_id}.part"
+
+        if temp.is_symlink():
+            self.api_error(403, "Enlaces simbólicos no permitidos")
+            return
+
+        if offset == 0:
+            self.remove_stale_uploads(directory)
+            received = 0
+        else:
+            try:
+                received = temp.stat().st_size if not temp.is_symlink() else -1
+            except FileNotFoundError:
+                received = 0
+            if received < offset:
+                # Falta información anterior: el cliente debe continuar desde aquí.
+                self.discard_body(length)
+                self.send_json(
+                    {
+                        "ok": False,
+                        "error": "La subida no coincide con lo recibido",
+                        "received": max(received, 0),
+                    },
+                    409,
+                )
+                return
+
         remaining = length
 
         try:
-            with open(temp, "wb") as output:
+            with open(temp, "r+b" if offset else "wb") as output:
+                # Si un trozo llegó a medias, se sobrescribe desde su inicio.
+                output.seek(offset)
+                output.truncate()
                 while remaining > 0:
                     chunk = self.rfile.read(min(1024 * 1024, remaining))
                     if not chunk:
@@ -1156,15 +1211,21 @@ class ShareHandler(BaseHTTPRequestHandler):
                     output.write(chunk)
                     remaining -= len(chunk)
 
+            if offset + length < total:
+                self.send_json({"ok": True, "received": offset + length})
+                return
+
             with FILE_OP_LOCK:
                 target = unique_path(directory, filename)
                 os.replace(temp, target)
 
         except Exception as exc:
-            try:
-                temp.unlink(missing_ok=True)
-            except Exception:
-                pass
+            # Las subidas reanudables conservan lo recibido para continuar.
+            if not resumable:
+                try:
+                    temp.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
             console_event(f"Error subiendo {filename}: {exc}")
             self.api_error(500, "Error guardando el archivo")
@@ -1172,17 +1233,48 @@ class ShareHandler(BaseHTTPRequestHandler):
 
         console_event(
             f"↑ SUBIDO: {relative_path(target)} "
-            f"({human_size(length)})"
+            f"({human_size(total)})"
         )
 
-        self.send_json(
-            {
-                "ok": True,
-                "name": target.name,
-                "path": relative_path(target),
-                "size": length,
-            }
-        )
+        result = {
+            "ok": True,
+            "name": target.name,
+            "path": relative_path(target),
+            "size": total,
+            "received": total,
+        }
+
+        if resumable:
+            with FILE_OP_LOCK:
+                COMPLETED_UPLOADS[upload_id] = result
+                while len(COMPLETED_UPLOADS) > COMPLETED_UPLOADS_MAX:
+                    COMPLETED_UPLOADS.pop(next(iter(COMPLETED_UPLOADS)))
+
+        self.send_json(result)
+
+    def discard_body(self, length: int):
+        """Lee y descarta el cuerpo para no cortar la conexión al responder antes."""
+        remaining = length
+        try:
+            while remaining > 0:
+                chunk = self.rfile.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+        except OSError:
+            pass
+
+    def remove_stale_uploads(self, directory: Path):
+        """Elimina subidas abandonadas hace más de un día en esta carpeta."""
+        limit = time.time() - STALE_UPLOAD_SECONDS
+        try:
+            for entry in directory.iterdir():
+                if (entry.name.startswith(".upload-") and entry.name.endswith(".part")
+                        and not entry.is_symlink() and entry.is_file()
+                        and entry.stat().st_mtime < limit):
+                    entry.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     # --------------------------------------------------------
     # API: crear carpeta
@@ -1520,7 +1612,7 @@ main { width:min(100%,900px); margin:0 auto; padding:18px; }
 h1 { margin:0 0 4px; font-size:1.45rem; }.path { margin-bottom:18px; color:var(--muted); word-break:break-all; }
 .toolbar { display:grid; gap:10px; margin-bottom:14px; }.upload-box { padding:10px; border:1px solid var(--border); border-radius:12px; background:var(--panel); }.upload-row { display:grid; grid-template-columns:1fr 1fr; gap:8px; }.upload-row #uploadButton { grid-column:1 / -1; }input[type=file] { display:none; }
 .button { min-height:44px; border:0; border-radius:8px; padding:10px 14px; display:inline-flex; align-items:center; justify-content:center; gap:8px; font-weight:650; cursor:pointer; }.button:disabled { opacity:.45; cursor:default; }.button-primary { background:var(--primary); color:white; }.button-primary:hover:not(:disabled) { background:var(--primary-hover); }.button-secondary { background:#374151; color:var(--text); }.button-secondary:hover:not(:disabled) { background:#4b5563; }.button-danger { background:var(--danger); color:white; }.button-danger:hover:not(:disabled) { background:var(--danger-hover); }.button-wide { width:100%; }
-.selection,.progress { display:none; margin-top:8px; font-size:.86rem; }.selection.visible,.progress.visible { display:block; }.selection { color:var(--muted); overflow-wrap:anywhere; }.progress { color:#93c5fd; }
+.selection,.progress { display:none; margin-top:8px; font-size:.86rem; }.selection.visible,.progress.visible { display:block; }.selection { color:var(--muted); overflow-wrap:anywhere; }.progress { color:#93c5fd; overflow-wrap:anywhere; }.progress.error { color:#fca5a5; }.progress-bar { display:none; height:8px; margin-top:10px; overflow:hidden; border:1px solid var(--border); border-radius:999px; background:var(--panel-2); }.progress-bar.visible { display:block; }.progress-fill { width:0; height:100%; background:var(--primary); transition:width .15s linear; }.progress-bar.error .progress-fill { background:var(--danger); }
 .batch-bar { display:none; gap:8px; align-items:center; margin-bottom:10px; padding:10px; border:1px solid #365b92; border-radius:12px; background:rgba(30,64,175,.12); }.batch-bar.visible { display:grid; }.batch-summary { display:flex; align-items:center; justify-content:space-between; gap:10px; color:#bfdbfe; font-size:.9rem; }.batch-actions { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; }.batch-actions .button { min-height:40px; padding:8px 10px; font-size:.9rem; }.batch-clear { border:0; background:transparent; color:#93c5fd; cursor:pointer; padding:4px; }
 .list-head { display:flex; justify-content:flex-end; margin-bottom:8px; }.select-all-button { border:0; background:transparent; color:var(--muted); display:inline-flex; align-items:center; gap:7px; padding:5px 4px; cursor:pointer; font-size:.84rem; }.select-all-button:hover { color:var(--text); }
 .files { overflow:hidden; border:1px solid var(--border); border-radius:12px; }.item { min-height:62px; display:flex; align-items:stretch; border-bottom:1px solid var(--border); transition:background .12s ease; }.item:last-child { border-bottom:0; }.item:hover { background:var(--panel); }.item.is-selected { background:var(--selected); }.item-link,.parent-row { flex:1; min-width:0; display:flex; align-items:center; gap:12px; padding:11px 12px; color:inherit; text-decoration:none; }.parent-row { border-bottom:1px solid var(--border); }.item-icon { flex:0 0 auto; display:inline-flex; color:#93c5fd; }.item-main { min-width:0; display:flex; flex-direction:column; gap:2px; }.item-name { overflow-wrap:anywhere; font-weight:600; }.item-meta { color:var(--muted); font-size:.8rem; font-weight:400; }
@@ -1534,7 +1626,7 @@ h1 { margin:0 0 4px; font-size:1.45rem; }.path { margin-bottom:18px; color:var(-
 <body>
 <main>
 <div class="brand">__SHARE_ICON__<h1>Simple Share</h1></div><div class="path">__DISPLAY_PATH__</div>
-<div class="toolbar"><div class="upload-box"><div class="upload-row"><label for="files" class="button button-secondary">__PAPERCLIP_ICON__<span>Elegir archivos</span></label><label for="folder" class="button button-secondary">__FOLDER_ICON__<span>Elegir carpeta</span></label><button id="uploadButton" class="button button-primary" type="button" disabled>__UPLOAD_ICON__<span>Subir</span></button></div><input id="files" type="file" multiple><input id="folder" type="file" webkitdirectory multiple><div id="selection" class="selection"></div><div id="progress" class="progress"></div></div><button id="newFolderButton" class="button button-secondary button-wide" type="button">__PLUS_FOLDER_ICON__<span>Nueva carpeta</span></button></div>
+<div class="toolbar"><div class="upload-box"><div class="upload-row"><label for="files" class="button button-secondary">__PAPERCLIP_ICON__<span>Elegir archivos</span></label><label for="folder" class="button button-secondary">__FOLDER_ICON__<span>Elegir carpeta</span></label><button id="uploadButton" class="button button-primary" type="button" disabled>__UPLOAD_ICON__<span>Subir</span></button></div><input id="files" type="file" multiple><input id="folder" type="file" webkitdirectory multiple><div id="selection" class="selection"></div><div id="progressBar" class="progress-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div id="progressFill" class="progress-fill"></div></div><div id="progress" class="progress"></div></div><button id="newFolderButton" class="button button-secondary button-wide" type="button">__PLUS_FOLDER_ICON__<span>Nueva carpeta</span></button></div>
 <div id="batchBar" class="batch-bar"><div class="batch-summary"><strong id="batchCount">0 seleccionados</strong><button id="clearSelectionButton" class="batch-clear" type="button">Limpiar</button></div><div class="batch-actions"><button id="batchMoveButton" class="button button-secondary" type="button">__MOVE_ICON__<span>Mover</span></button><button id="batchCopyButton" class="button button-secondary" type="button">__COPY_ICON__<span>Copiar</span></button><button id="batchDeleteButton" class="button button-danger" type="button">__TRASH_ICON__<span>Eliminar</span></button></div></div>
 <div class="list-head"><button id="selectAllButton" class="select-all-button" type="button">__SELECT_ALL_ICON__<span>Seleccionar todo</span></button></div>
 <div class="files">__ROWS__</div>
@@ -1543,10 +1635,23 @@ h1 { margin:0 0 4px; font-size:1.45rem; }.path { margin-bottom:18px; color:var(-
 <script>
 const currentDir=__CURRENT_DIR__;let selectedItem=null;let toastTimer=null;const selectedItems=new Map();
 const ICONS={edit:'<svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m4 20 4.5-1 10-10a2.1 2.1 0 0 0-3-3l-10 10z"/><path d="m14.5 7 3 3"/></svg>',move:'<svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12h16"/><path d="m15 7 5 5-5 5"/><path d="M9 7 4 12l5 5"/></svg>',copy:'<svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="8" width="11" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h2"/></svg>',trash:'<svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V4h6v3M7 7l1 14h8l1-14M10 11v6M14 11v6"/></svg>'};
-const fileInput=document.getElementById("files"),folderInput=document.getElementById("folder"),uploadButton=document.getElementById("uploadButton"),selection=document.getElementById("selection"),progress=document.getElementById("progress"),newFolderButton=document.getElementById("newFolderButton"),batchBar=document.getElementById("batchBar"),batchCount=document.getElementById("batchCount"),selectAllButton=document.getElementById("selectAllButton"),clearSelectionButton=document.getElementById("clearSelectionButton"),batchMoveButton=document.getElementById("batchMoveButton"),batchCopyButton=document.getElementById("batchCopyButton"),batchDeleteButton=document.getElementById("batchDeleteButton"),modalBackdrop=document.getElementById("modalBackdrop"),modalTitle=document.getElementById("modalTitle"),modalText=document.getElementById("modalText"),modalBody=document.getElementById("modalBody"),modalActions=document.getElementById("modalActions"),toast=document.getElementById("toast");
+const fileInput=document.getElementById("files"),folderInput=document.getElementById("folder"),uploadButton=document.getElementById("uploadButton"),selection=document.getElementById("selection"),progress=document.getElementById("progress"),progressBar=document.getElementById("progressBar"),progressFill=document.getElementById("progressFill"),newFolderButton=document.getElementById("newFolderButton"),batchBar=document.getElementById("batchBar"),batchCount=document.getElementById("batchCount"),selectAllButton=document.getElementById("selectAllButton"),clearSelectionButton=document.getElementById("clearSelectionButton"),batchMoveButton=document.getElementById("batchMoveButton"),batchCopyButton=document.getElementById("batchCopyButton"),batchDeleteButton=document.getElementById("batchDeleteButton"),modalBackdrop=document.getElementById("modalBackdrop"),modalTitle=document.getElementById("modalTitle"),modalText=document.getElementById("modalText"),modalBody=document.getElementById("modalBody"),modalActions=document.getElementById("modalActions"),toast=document.getElementById("toast");
 function showToast(message,isError=false){clearTimeout(toastTimer);toast.textContent=message;toast.className="toast visible"+(isError?" error":"");toastTimer=setTimeout(()=>{toast.className="toast";},2600);}async function api(url,options={}){const response=await fetch(url,options);let data=null;try{data=await response.json();}catch{data={};}if(!response.ok)throw new Error(data.error||`HTTP ${response.status}`);return data;}function postJson(url,data){return api(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});}function button(label,className,onClick,iconName=null){const el=document.createElement("button");el.type="button";el.className=`button ${className}`;if(iconName&&ICONS[iconName])el.insertAdjacentHTML("beforeend",ICONS[iconName]);const text=document.createElement("span");text.textContent=label;el.appendChild(text);el.addEventListener("click",onClick);return el;}function field(value="",placeholder=""){const el=document.createElement("input");el.className="field";el.type="text";el.value=value;el.placeholder=placeholder;el.autocomplete="off";return el;}function openModal(title,text=""){modalTitle.textContent=title;modalText.textContent=text;modalBody.replaceChildren();modalActions.replaceChildren();modalBackdrop.classList.add("visible");modalBackdrop.setAttribute("aria-hidden","false");}function closeModal(){modalBackdrop.classList.remove("visible");modalBackdrop.setAttribute("aria-hidden","true");modalBody.replaceChildren();modalActions.replaceChildren();}function addCancelButton(){modalActions.appendChild(button("Cancelar","button-secondary",closeModal));}
 modalBackdrop.addEventListener("click",e=>{if(e.target===modalBackdrop)closeModal();});document.addEventListener("keydown",e=>{if(e.key==="Escape"&&modalBackdrop.classList.contains("visible"))closeModal();});
-function pendingUploads(){const items=[...fileInput.files].map(file=>({file,parts:[file.name]}));for(const file of folderInput.files){const parts=(file.webkitRelativePath||file.name).split("/").filter(Boolean);items.push({file,parts});}return items;}function updateSelection(){const items=pendingUploads();if(!items.length){selection.classList.remove("visible");selection.textContent="";uploadButton.disabled=true;return;}uploadButton.disabled=false;selection.classList.add("visible");const folders=new Set(items.filter(i=>i.parts.length>1).map(i=>i.parts[0]));const loose=items.filter(i=>i.parts.length===1).length;const pieces=[];if(folders.size)pieces.push(folders.size===1?`Carpeta ${[...folders][0]} (${items.length-loose} archivo(s))`:`${folders.size} carpetas (${items.length-loose} archivo(s))`);if(loose)pieces.push(loose===1?items.find(i=>i.parts.length===1).file.name:`${loose} archivos seleccionados`);selection.textContent=pieces.join(" · ");}fileInput.addEventListener("change",updateSelection);folderInput.addEventListener("change",updateSelection);uploadButton.addEventListener("click",async()=>{const items=pendingUploads();if(!items.length)return;uploadButton.disabled=true;progress.classList.add("visible");const createdFolders=new Map();try{for(let i=0;i<items.length;i++){const{file,parts}=items[i];let dir=currentDir,subdir="";if(parts.length>1){if(!createdFolders.has(parts[0])){const created=await postJson("/api/mkdir",{dir:currentDir,name:parts[0],unique:true});createdFolders.set(parts[0],created.path);}dir=createdFolders.get(parts[0]);subdir=parts.slice(1,-1).join("/");}progress.textContent=`Subiendo ${i+1}/${items.length} · ${parts.join("/")}`;const url="/api/upload?dir="+encodeURIComponent(dir)+"&subdir="+encodeURIComponent(subdir)+"&name="+encodeURIComponent(parts[parts.length-1]);await api(url,{method:"POST",headers:{"Content-Type":"application/octet-stream"},body:file});}progress.textContent=`${items.length} archivo(s) subido(s)`;setTimeout(()=>location.reload(),350);}catch(error){progress.textContent="Error: "+error.message;uploadButton.disabled=false;}});
+const CHUNK_SIZE=8*1024*1024,MAX_AUTO_RETRIES=3;let uploadState=null,uploading=false;
+function pendingUploads(){const items=[...fileInput.files].map(file=>({file,parts:[file.name]}));for(const file of folderInput.files){const parts=(file.webkitRelativePath||file.name).split("/").filter(Boolean);items.push({file,parts});}return items;}
+function setUploadLabel(text){uploadButton.querySelector("span").textContent=text;}function formatBytes(bytes){const units=["B","KB","MB","GB","TB"];let value=bytes,unit=0;while(value>=1024&&unit<units.length-1){value/=1024;unit++;}return`${unit?value.toFixed(1):value} ${units[unit]}`;}function newUploadId(){const bytes=new Uint8Array(16);crypto.getRandomValues(bytes);return[...bytes].map(b=>b.toString(16).padStart(2,"0")).join("");}
+function updateSelection(){if(uploading)return;uploadState=null;setUploadLabel("Subir");progress.classList.remove("visible","error");progressBar.classList.remove("visible","error");const items=pendingUploads();if(!items.length){selection.classList.remove("visible");selection.textContent="";uploadButton.disabled=true;return;}uploadButton.disabled=false;selection.classList.add("visible");const folders=new Set(items.filter(i=>i.parts.length>1).map(i=>i.parts[0]));const loose=items.filter(i=>i.parts.length===1).length;const pieces=[];if(folders.size)pieces.push(folders.size===1?`Carpeta ${[...folders][0]} (${items.length-loose} archivo(s))`:`${folders.size} carpetas (${items.length-loose} archivo(s))`);if(loose)pieces.push(loose===1?items.find(i=>i.parts.length===1).file.name:`${loose} archivos seleccionados`);selection.textContent=pieces.join(" · ");}
+fileInput.addEventListener("change",updateSelection);folderInput.addEventListener("change",updateSelection);window.addEventListener("beforeunload",e=>{if(uploading){e.preventDefault();e.returnValue="";}});
+function renderProgress(currentLoaded=0,note=""){const st=uploadState;const sent=Math.min(st.totalBytes,st.items.reduce((sum,item)=>sum+item.offset,0)+currentLoaded);const percent=st.totalBytes?Math.floor(sent*100/st.totalBytes):Math.floor(st.index*100/st.items.length);progressFill.style.width=percent+"%";progressBar.setAttribute("aria-valuenow",String(percent));const item=st.items[Math.min(st.index,st.items.length-1)];progress.textContent=note||`${percent}% · ${formatBytes(sent)} de ${formatBytes(st.totalBytes)} · ${Math.min(st.index+1,st.items.length)}/${st.items.length} · ${item.parts.join("/")}`;}
+function sendChunk(url,body,onProgress){return new Promise((resolve,reject)=>{const xhr=new XMLHttpRequest();xhr.open("POST",url);xhr.setRequestHeader("Content-Type","application/octet-stream");xhr.upload.onprogress=e=>onProgress(e.loaded);xhr.onload=()=>{let data={};try{data=JSON.parse(xhr.responseText);}catch{}if(xhr.status>=200&&xhr.status<300){resolve(data);return;}const error=new Error(data.error||`HTTP ${xhr.status}`);error.status=xhr.status;error.data=data;reject(error);};xhr.onerror=()=>reject(new Error("Conexión interrumpida"));xhr.onabort=()=>reject(new Error("Subida cancelada"));xhr.send(body);});}
+function isRetryable(error){return!error.status||error.status>=500||error.status===408||error.status===409;}const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+async function uploadItem(st,item,onChunkDone){if(item.dir===null){if(item.parts.length>1){const top=item.parts[0];if(!st.createdFolders.has(top)){const created=await postJson("/api/mkdir",{dir:currentDir,name:top,unique:true});st.createdFolders.set(top,created.path);}item.dir=st.createdFolders.get(top);item.subdir=item.parts.slice(1,-1).join("/");}else{item.dir=currentDir;item.subdir="";}}
+do{const end=Math.min(item.offset+CHUNK_SIZE,item.file.size);const query=new URLSearchParams({dir:item.dir,subdir:item.subdir,name:item.parts[item.parts.length-1],id:item.id,offset:String(item.offset),total:String(item.file.size)});try{const data=await sendChunk("/api/upload?"+query,item.file.slice(item.offset,end),loaded=>renderProgress(loaded));item.offset=typeof data.received==="number"?data.received:end;}catch(error){if(error.status===409&&typeof error.data?.received==="number"){item.offset=error.data.received;continue;}throw error;}onChunkDone();renderProgress();}while(item.offset<item.file.size);}
+async function runUpload(){const st=uploadState;uploading=true;uploadButton.disabled=true;fileInput.disabled=folderInput.disabled=true;setUploadLabel("Subiendo…");progress.classList.add("visible");progress.classList.remove("error");progressBar.classList.add("visible");progressBar.classList.remove("error");let retries=0;renderProgress();
+while(st.index<st.items.length){const item=st.items[st.index];try{await uploadItem(st,item,()=>{retries=0;});st.index++;retries=0;renderProgress();}catch(error){if(isRetryable(error)&&retries<MAX_AUTO_RETRIES){retries++;renderProgress(0,`${error.message}. Reintentando (${retries}/${MAX_AUTO_RETRIES})…`);await wait(1000*2**(retries-1));continue;}uploading=false;fileInput.disabled=folderInput.disabled=false;progress.classList.add("error");progressBar.classList.add("error");renderProgress(0,`Error en ${item.parts.join("/")}: ${error.message}. Pulsa «Reintentar» para continuar desde donde se quedó.`);setUploadLabel("Reintentar");uploadButton.disabled=false;return;}}
+uploading=false;progressFill.style.width="100%";progress.textContent=`${st.items.length} archivo(s) subido(s)`;setUploadLabel("Subir");setTimeout(()=>location.reload(),350);}
+uploadButton.addEventListener("click",()=>{if(uploading)return;if(!uploadState){const items=pendingUploads();if(!items.length)return;uploadState={items:items.map(i=>({...i,id:newUploadId(),offset:0,dir:null,subdir:""})),index:0,createdFolders:new Map(),totalBytes:items.reduce((sum,i)=>sum+i.file.size,0)};}runUpload();});
 newFolderButton.addEventListener("click",()=>{openModal("Nueva carpeta",`Se creará dentro de ${currentDir?"/"+currentDir:"/"}`);const input=field("","Nombre de la carpeta");modalBody.appendChild(input);addCancelButton();const create=button("Crear","button-primary",async()=>{const name=input.value.trim();if(!name){input.focus();return;}create.disabled=true;try{await postJson("/api/mkdir",{dir:currentDir,name});location.reload();}catch(error){showToast(error.message,true);create.disabled=false;input.focus();}});modalActions.appendChild(create);input.addEventListener("keydown",e=>{if(e.key==="Enter")create.click();});setTimeout(()=>input.focus(),0);});
 function itemFromCheckbox(check){return{path:check.dataset.path,name:check.dataset.name,kind:check.dataset.kind};}function setChecked(check,checked){check.checked=checked;const item=itemFromCheckbox(check);if(checked)selectedItems.set(item.path,item);else selectedItems.delete(item.path);}function syncSelectionUI(){document.querySelectorAll(".item-check").forEach(check=>check.closest(".item").classList.toggle("is-selected",check.checked));const count=selectedItems.size;batchCount.textContent=count===1?"1 seleccionado":`${count} seleccionados`;batchBar.classList.toggle("visible",count>0);const checks=[...document.querySelectorAll(".item-check")];const allSelected=checks.length>0&&checks.every(check=>check.checked);selectAllButton.querySelector("span").textContent=allSelected?"Deseleccionar todo":"Seleccionar todo";}document.querySelectorAll(".item-check").forEach(check=>check.addEventListener("change",()=>{setChecked(check,check.checked);syncSelectionUI();}));selectAllButton.addEventListener("click",()=>{const checks=[...document.querySelectorAll(".item-check")];const shouldSelect=checks.length>0&&!checks.every(check=>check.checked);checks.forEach(check=>setChecked(check,shouldSelect));syncSelectionUI();});clearSelectionButton.addEventListener("click",()=>{document.querySelectorAll(".item-check").forEach(check=>setChecked(check,false));syncSelectionUI();});function selectedArray(){return[...selectedItems.values()];}
 batchMoveButton.addEventListener("click",()=>openBatchDestination("move"));batchCopyButton.addEventListener("click",()=>openBatchDestination("copy"));batchDeleteButton.addEventListener("click",openBatchDelete);
