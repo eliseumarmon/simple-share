@@ -1093,6 +1093,32 @@ class ShareHandler(BaseHTTPRequestHandler):
         if directory is None:
             return
 
+        # Subcarpetas relativas al subir una carpeta completa ("a/b").
+        subdir = params.get("subdir", [""])[0]
+        subdir_parts = [part for part in subdir.split("/") if part.strip()]
+        if not all(valid_name(part) for part in subdir_parts):
+            self.api_error(400, "Ruta de subcarpeta no válida")
+            return
+
+        try:
+            with FILE_OP_LOCK:
+                for part in subdir_parts:
+                    directory = directory / part.strip()
+                    if directory.is_symlink():
+                        raise ValueError("Enlaces simbólicos no permitidos")
+                    if not directory.exists():
+                        directory.mkdir()
+                    elif not directory.is_dir():
+                        raise ValueError(
+                            f"Ya existe un archivo llamado {part.strip()}"
+                        )
+        except ValueError as exc:
+            self.api_error(409, str(exc))
+            return
+        except OSError as exc:
+            self.api_error(500, f"No se pudo crear la subcarpeta: {exc}")
+            return
+
         raw_length = self.headers.get("Content-Length")
 
         if raw_length is None:
@@ -1177,14 +1203,17 @@ class ShareHandler(BaseHTTPRequestHandler):
             self.api_error(400, "Nombre de carpeta no válido")
             return
 
-        target = directory / name.strip()
-
-        if target.exists():
-            self.api_error(409, "Ya existe un archivo o carpeta con ese nombre")
-            return
-
         try:
-            target.mkdir()
+            with FILE_OP_LOCK:
+                if data.get("unique"):
+                    # Al subir carpetas, "Fotos" pasa a "Fotos (1)" si ya existe.
+                    target = unique_path(directory, name.strip())
+                else:
+                    target = directory / name.strip()
+                    if target.exists() or target.is_symlink():
+                        self.api_error(409, "Ya existe un archivo o carpeta con ese nombre")
+                        return
+                target.mkdir()
         except OSError as exc:
             self.api_error(500, f"No se pudo crear la carpeta: {exc}")
             return
@@ -1489,7 +1518,7 @@ button,input,select { font:inherit; } button { touch-action:manipulation; }
 main { width:min(100%,900px); margin:0 auto; padding:18px; }
 .brand { display:flex; align-items:center; gap:9px; }.brand svg { width:1.35rem; height:1.35rem; color:#93c5fd; }
 h1 { margin:0 0 4px; font-size:1.45rem; }.path { margin-bottom:18px; color:var(--muted); word-break:break-all; }
-.toolbar { display:grid; gap:10px; margin-bottom:14px; }.upload-box { padding:10px; border:1px solid var(--border); border-radius:12px; background:var(--panel); }.upload-row { display:grid; grid-template-columns:1fr 1fr; gap:8px; }input[type=file] { display:none; }
+.toolbar { display:grid; gap:10px; margin-bottom:14px; }.upload-box { padding:10px; border:1px solid var(--border); border-radius:12px; background:var(--panel); }.upload-row { display:grid; grid-template-columns:1fr 1fr; gap:8px; }.upload-row #uploadButton { grid-column:1 / -1; }input[type=file] { display:none; }
 .button { min-height:44px; border:0; border-radius:8px; padding:10px 14px; display:inline-flex; align-items:center; justify-content:center; gap:8px; font-weight:650; cursor:pointer; }.button:disabled { opacity:.45; cursor:default; }.button-primary { background:var(--primary); color:white; }.button-primary:hover:not(:disabled) { background:var(--primary-hover); }.button-secondary { background:#374151; color:var(--text); }.button-secondary:hover:not(:disabled) { background:#4b5563; }.button-danger { background:var(--danger); color:white; }.button-danger:hover:not(:disabled) { background:var(--danger-hover); }.button-wide { width:100%; }
 .selection,.progress { display:none; margin-top:8px; font-size:.86rem; }.selection.visible,.progress.visible { display:block; }.selection { color:var(--muted); overflow-wrap:anywhere; }.progress { color:#93c5fd; }
 .batch-bar { display:none; gap:8px; align-items:center; margin-bottom:10px; padding:10px; border:1px solid #365b92; border-radius:12px; background:rgba(30,64,175,.12); }.batch-bar.visible { display:grid; }.batch-summary { display:flex; align-items:center; justify-content:space-between; gap:10px; color:#bfdbfe; font-size:.9rem; }.batch-actions { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; }.batch-actions .button { min-height:40px; padding:8px 10px; font-size:.9rem; }.batch-clear { border:0; background:transparent; color:#93c5fd; cursor:pointer; padding:4px; }
@@ -1499,13 +1528,13 @@ h1 { margin:0 0 4px; font-size:1.45rem; }.path { margin-bottom:18px; color:var(-
 .menu-button { width:50px; flex:0 0 50px; border:0; border-left:1px solid var(--border); background:transparent; color:var(--muted); display:grid; place-items:center; cursor:pointer; }.menu-button:hover { background:#374151; color:var(--text); }.menu-icon { width:20px; height:20px; }.empty { padding:28px 18px; text-align:center; color:var(--muted); }
 .modal-backdrop { position:fixed; inset:0; z-index:50; display:none; align-items:flex-end; justify-content:center; padding:14px; background:rgba(0,0,0,.58); }.modal-backdrop.visible { display:flex; }.modal { width:min(100%,520px); max-height:min(82vh,680px); overflow:auto; padding:18px; border:1px solid var(--border-strong); border-radius:16px; background:var(--panel); box-shadow:0 20px 60px rgba(0,0,0,.35); }.modal h2 { margin:0 0 6px; font-size:1.1rem; overflow-wrap:anywhere; }.modal-text { margin:0 0 15px; color:var(--muted); font-size:.92rem; overflow-wrap:anywhere; white-space:pre-line; }.modal-body { display:grid; gap:10px; }.modal-actions { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:15px; }.action-list { display:grid; gap:8px; }.field { width:100%; min-width:0; min-height:44px; border:1px solid var(--border-strong); border-radius:8px; padding:10px 12px; outline:none; background:var(--panel-2); color:var(--text); }.field:focus { border-color:#3b82f6; }
 .toast { position:fixed; left:50%; bottom:18px; z-index:100; display:none; max-width:calc(100vw - 30px); transform:translateX(-50%); padding:10px 14px; border:1px solid var(--border-strong); border-radius:10px; background:#0f172a; color:var(--text); box-shadow:0 12px 30px rgba(0,0,0,.35); }.toast.visible { display:block; }.toast.error { border-color:#7f1d1d; }
-@media (min-width:640px) { .modal-backdrop { align-items:center; }.batch-bar.visible { grid-template-columns:1fr auto; }.batch-actions { grid-template-columns:repeat(3,auto); } }
+@media (min-width:640px) { .upload-row { grid-template-columns:repeat(3,1fr); }.upload-row #uploadButton { grid-column:auto; }.modal-backdrop { align-items:center; }.batch-bar.visible { grid-template-columns:1fr auto; }.batch-actions { grid-template-columns:repeat(3,auto); } }
 </style>
 </head>
 <body>
 <main>
 <div class="brand">__SHARE_ICON__<h1>Simple Share</h1></div><div class="path">__DISPLAY_PATH__</div>
-<div class="toolbar"><div class="upload-box"><div class="upload-row"><label for="files" class="button button-secondary">__PAPERCLIP_ICON__<span>Elegir archivos</span></label><button id="uploadButton" class="button button-primary" type="button" disabled>__UPLOAD_ICON__<span>Subir</span></button></div><input id="files" type="file" multiple><div id="selection" class="selection"></div><div id="progress" class="progress"></div></div><button id="newFolderButton" class="button button-secondary button-wide" type="button">__PLUS_FOLDER_ICON__<span>Nueva carpeta</span></button></div>
+<div class="toolbar"><div class="upload-box"><div class="upload-row"><label for="files" class="button button-secondary">__PAPERCLIP_ICON__<span>Elegir archivos</span></label><label for="folder" class="button button-secondary">__FOLDER_ICON__<span>Elegir carpeta</span></label><button id="uploadButton" class="button button-primary" type="button" disabled>__UPLOAD_ICON__<span>Subir</span></button></div><input id="files" type="file" multiple><input id="folder" type="file" webkitdirectory multiple><div id="selection" class="selection"></div><div id="progress" class="progress"></div></div><button id="newFolderButton" class="button button-secondary button-wide" type="button">__PLUS_FOLDER_ICON__<span>Nueva carpeta</span></button></div>
 <div id="batchBar" class="batch-bar"><div class="batch-summary"><strong id="batchCount">0 seleccionados</strong><button id="clearSelectionButton" class="batch-clear" type="button">Limpiar</button></div><div class="batch-actions"><button id="batchMoveButton" class="button button-secondary" type="button">__MOVE_ICON__<span>Mover</span></button><button id="batchCopyButton" class="button button-secondary" type="button">__COPY_ICON__<span>Copiar</span></button><button id="batchDeleteButton" class="button button-danger" type="button">__TRASH_ICON__<span>Eliminar</span></button></div></div>
 <div class="list-head"><button id="selectAllButton" class="select-all-button" type="button">__SELECT_ALL_ICON__<span>Seleccionar todo</span></button></div>
 <div class="files">__ROWS__</div>
@@ -1514,10 +1543,10 @@ h1 { margin:0 0 4px; font-size:1.45rem; }.path { margin-bottom:18px; color:var(-
 <script>
 const currentDir=__CURRENT_DIR__;let selectedItem=null;let toastTimer=null;const selectedItems=new Map();
 const ICONS={edit:'<svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="m4 20 4.5-1 10-10a2.1 2.1 0 0 0-3-3l-10 10z"/><path d="m14.5 7 3 3"/></svg>',move:'<svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12h16"/><path d="m15 7 5 5-5 5"/><path d="M9 7 4 12l5 5"/></svg>',copy:'<svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="8" width="11" height="12" rx="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h2"/></svg>',trash:'<svg class="button-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M9 7V4h6v3M7 7l1 14h8l1-14M10 11v6M14 11v6"/></svg>'};
-const fileInput=document.getElementById("files"),uploadButton=document.getElementById("uploadButton"),selection=document.getElementById("selection"),progress=document.getElementById("progress"),newFolderButton=document.getElementById("newFolderButton"),batchBar=document.getElementById("batchBar"),batchCount=document.getElementById("batchCount"),selectAllButton=document.getElementById("selectAllButton"),clearSelectionButton=document.getElementById("clearSelectionButton"),batchMoveButton=document.getElementById("batchMoveButton"),batchCopyButton=document.getElementById("batchCopyButton"),batchDeleteButton=document.getElementById("batchDeleteButton"),modalBackdrop=document.getElementById("modalBackdrop"),modalTitle=document.getElementById("modalTitle"),modalText=document.getElementById("modalText"),modalBody=document.getElementById("modalBody"),modalActions=document.getElementById("modalActions"),toast=document.getElementById("toast");
+const fileInput=document.getElementById("files"),folderInput=document.getElementById("folder"),uploadButton=document.getElementById("uploadButton"),selection=document.getElementById("selection"),progress=document.getElementById("progress"),newFolderButton=document.getElementById("newFolderButton"),batchBar=document.getElementById("batchBar"),batchCount=document.getElementById("batchCount"),selectAllButton=document.getElementById("selectAllButton"),clearSelectionButton=document.getElementById("clearSelectionButton"),batchMoveButton=document.getElementById("batchMoveButton"),batchCopyButton=document.getElementById("batchCopyButton"),batchDeleteButton=document.getElementById("batchDeleteButton"),modalBackdrop=document.getElementById("modalBackdrop"),modalTitle=document.getElementById("modalTitle"),modalText=document.getElementById("modalText"),modalBody=document.getElementById("modalBody"),modalActions=document.getElementById("modalActions"),toast=document.getElementById("toast");
 function showToast(message,isError=false){clearTimeout(toastTimer);toast.textContent=message;toast.className="toast visible"+(isError?" error":"");toastTimer=setTimeout(()=>{toast.className="toast";},2600);}async function api(url,options={}){const response=await fetch(url,options);let data=null;try{data=await response.json();}catch{data={};}if(!response.ok)throw new Error(data.error||`HTTP ${response.status}`);return data;}function postJson(url,data){return api(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});}function button(label,className,onClick,iconName=null){const el=document.createElement("button");el.type="button";el.className=`button ${className}`;if(iconName&&ICONS[iconName])el.insertAdjacentHTML("beforeend",ICONS[iconName]);const text=document.createElement("span");text.textContent=label;el.appendChild(text);el.addEventListener("click",onClick);return el;}function field(value="",placeholder=""){const el=document.createElement("input");el.className="field";el.type="text";el.value=value;el.placeholder=placeholder;el.autocomplete="off";return el;}function openModal(title,text=""){modalTitle.textContent=title;modalText.textContent=text;modalBody.replaceChildren();modalActions.replaceChildren();modalBackdrop.classList.add("visible");modalBackdrop.setAttribute("aria-hidden","false");}function closeModal(){modalBackdrop.classList.remove("visible");modalBackdrop.setAttribute("aria-hidden","true");modalBody.replaceChildren();modalActions.replaceChildren();}function addCancelButton(){modalActions.appendChild(button("Cancelar","button-secondary",closeModal));}
 modalBackdrop.addEventListener("click",e=>{if(e.target===modalBackdrop)closeModal();});document.addEventListener("keydown",e=>{if(e.key==="Escape"&&modalBackdrop.classList.contains("visible"))closeModal();});
-fileInput.addEventListener("change",()=>{const files=[...fileInput.files];if(!files.length){selection.classList.remove("visible");selection.textContent="";uploadButton.disabled=true;return;}uploadButton.disabled=false;selection.classList.add("visible");selection.textContent=files.length===1?files[0].name:`${files.length} archivos seleccionados`;});uploadButton.addEventListener("click",async()=>{const files=[...fileInput.files];if(!files.length)return;uploadButton.disabled=true;progress.classList.add("visible");try{for(let i=0;i<files.length;i++){const file=files[i];progress.textContent=`Subiendo ${i+1}/${files.length} · ${file.name}`;const url="/api/upload?dir="+encodeURIComponent(currentDir)+"&name="+encodeURIComponent(file.name);await api(url,{method:"POST",headers:{"Content-Type":"application/octet-stream"},body:file});}progress.textContent=`${files.length} archivo(s) subido(s)`;setTimeout(()=>location.reload(),350);}catch(error){progress.textContent="Error: "+error.message;uploadButton.disabled=false;}});
+function pendingUploads(){const items=[...fileInput.files].map(file=>({file,parts:[file.name]}));for(const file of folderInput.files){const parts=(file.webkitRelativePath||file.name).split("/").filter(Boolean);items.push({file,parts});}return items;}function updateSelection(){const items=pendingUploads();if(!items.length){selection.classList.remove("visible");selection.textContent="";uploadButton.disabled=true;return;}uploadButton.disabled=false;selection.classList.add("visible");const folders=new Set(items.filter(i=>i.parts.length>1).map(i=>i.parts[0]));const loose=items.filter(i=>i.parts.length===1).length;const pieces=[];if(folders.size)pieces.push(folders.size===1?`Carpeta ${[...folders][0]} (${items.length-loose} archivo(s))`:`${folders.size} carpetas (${items.length-loose} archivo(s))`);if(loose)pieces.push(loose===1?items.find(i=>i.parts.length===1).file.name:`${loose} archivos seleccionados`);selection.textContent=pieces.join(" · ");}fileInput.addEventListener("change",updateSelection);folderInput.addEventListener("change",updateSelection);uploadButton.addEventListener("click",async()=>{const items=pendingUploads();if(!items.length)return;uploadButton.disabled=true;progress.classList.add("visible");const createdFolders=new Map();try{for(let i=0;i<items.length;i++){const{file,parts}=items[i];let dir=currentDir,subdir="";if(parts.length>1){if(!createdFolders.has(parts[0])){const created=await postJson("/api/mkdir",{dir:currentDir,name:parts[0],unique:true});createdFolders.set(parts[0],created.path);}dir=createdFolders.get(parts[0]);subdir=parts.slice(1,-1).join("/");}progress.textContent=`Subiendo ${i+1}/${items.length} · ${parts.join("/")}`;const url="/api/upload?dir="+encodeURIComponent(dir)+"&subdir="+encodeURIComponent(subdir)+"&name="+encodeURIComponent(parts[parts.length-1]);await api(url,{method:"POST",headers:{"Content-Type":"application/octet-stream"},body:file});}progress.textContent=`${items.length} archivo(s) subido(s)`;setTimeout(()=>location.reload(),350);}catch(error){progress.textContent="Error: "+error.message;uploadButton.disabled=false;}});
 newFolderButton.addEventListener("click",()=>{openModal("Nueva carpeta",`Se creará dentro de ${currentDir?"/"+currentDir:"/"}`);const input=field("","Nombre de la carpeta");modalBody.appendChild(input);addCancelButton();const create=button("Crear","button-primary",async()=>{const name=input.value.trim();if(!name){input.focus();return;}create.disabled=true;try{await postJson("/api/mkdir",{dir:currentDir,name});location.reload();}catch(error){showToast(error.message,true);create.disabled=false;input.focus();}});modalActions.appendChild(create);input.addEventListener("keydown",e=>{if(e.key==="Enter")create.click();});setTimeout(()=>input.focus(),0);});
 function itemFromCheckbox(check){return{path:check.dataset.path,name:check.dataset.name,kind:check.dataset.kind};}function setChecked(check,checked){check.checked=checked;const item=itemFromCheckbox(check);if(checked)selectedItems.set(item.path,item);else selectedItems.delete(item.path);}function syncSelectionUI(){document.querySelectorAll(".item-check").forEach(check=>check.closest(".item").classList.toggle("is-selected",check.checked));const count=selectedItems.size;batchCount.textContent=count===1?"1 seleccionado":`${count} seleccionados`;batchBar.classList.toggle("visible",count>0);const checks=[...document.querySelectorAll(".item-check")];const allSelected=checks.length>0&&checks.every(check=>check.checked);selectAllButton.querySelector("span").textContent=allSelected?"Deseleccionar todo":"Seleccionar todo";}document.querySelectorAll(".item-check").forEach(check=>check.addEventListener("change",()=>{setChecked(check,check.checked);syncSelectionUI();}));selectAllButton.addEventListener("click",()=>{const checks=[...document.querySelectorAll(".item-check")];const shouldSelect=checks.length>0&&!checks.every(check=>check.checked);checks.forEach(check=>setChecked(check,shouldSelect));syncSelectionUI();});clearSelectionButton.addEventListener("click",()=>{document.querySelectorAll(".item-check").forEach(check=>setChecked(check,false));syncSelectionUI();});function selectedArray(){return[...selectedItems.values()];}
 batchMoveButton.addEventListener("click",()=>openBatchDestination("move"));batchCopyButton.addEventListener("click",()=>openBatchDestination("copy"));batchDeleteButton.addEventListener("click",openBatchDelete);
@@ -1537,6 +1566,7 @@ function openDelete(){const what=selectedItem.kind==="folder"?"La carpeta y todo
             "__ROWS__": "".join(rows),
             "__SHARE_ICON__": svg_icon("share"),
             "__PAPERCLIP_ICON__": svg_icon("paperclip", "button-icon"),
+            "__FOLDER_ICON__": svg_icon("folder", "button-icon"),
             "__UPLOAD_ICON__": svg_icon("upload", "button-icon"),
             "__PLUS_FOLDER_ICON__": svg_icon("plus-folder", "button-icon"),
             "__MOVE_ICON__": svg_icon("move", "button-icon"),

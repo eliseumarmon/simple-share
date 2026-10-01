@@ -1,6 +1,7 @@
 import argparse
 import concurrent.futures
 import http.client
+import json
 import re
 import socket
 import urllib.parse
@@ -102,6 +103,57 @@ class RouteAndModeTests(unittest.TestCase):
                         {b"uno", b"dos"},
                     )
                     self.assertEqual(len(list(root.iterdir())), 2)
+                finally:
+                    server.shutdown()
+                    server.server_close()
+                    thread.join(timeout=2)
+
+    def test_folder_upload_creates_subdirectories(self):
+        with tempfile.TemporaryDirectory() as shared:
+            root = Path(shared)
+            (root / "Fotos").mkdir()
+            with patch.object(simple_share, "ROOT", root):
+                server = simple_share.ShareServer(("127.0.0.1", 0), simple_share.ShareHandler)
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    def post(path, body, content_type="application/octet-stream"):
+                        connection = http.client.HTTPConnection("127.0.0.1", server.server_port)
+                        connection.request(
+                            "POST", path, body=body,
+                            headers={
+                                "Origin": f"http://127.0.0.1:{server.server_port}",
+                                "Content-Type": content_type,
+                            },
+                        )
+                        response = connection.getresponse()
+                        result = response.status, response.read()
+                        connection.close()
+                        return result
+
+                    status, body = post(
+                        "/api/mkdir",
+                        json.dumps({"dir": "", "name": "Fotos", "unique": True}),
+                        "application/json",
+                    )
+                    self.assertEqual(status, 200)
+                    created = json.loads(body)["path"]
+                    self.assertEqual(created, "Fotos (1)")
+
+                    query = urllib.parse.urlencode(
+                        {"dir": created, "subdir": "2024/verano", "name": "playa.jpg"}
+                    )
+                    self.assertEqual(post("/api/upload?" + query, b"jpg")[0], 200)
+                    self.assertEqual(
+                        (root / "Fotos (1)" / "2024" / "verano" / "playa.jpg").read_bytes(),
+                        b"jpg",
+                    )
+
+                    query = urllib.parse.urlencode(
+                        {"dir": created, "subdir": "../fuera", "name": "x.txt"}
+                    )
+                    self.assertEqual(post("/api/upload?" + query, b"x")[0], 400)
+                    self.assertFalse((root / "fuera").exists())
                 finally:
                     server.shutdown()
                     server.server_close()

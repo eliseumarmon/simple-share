@@ -2,7 +2,7 @@
 
 Comparte una carpeta con otros dispositivos de tu red local desde el navegador. Solo necesitas Python 3.10 o posterior; no hay paquetes que instalar.
 
-Permite subir y descargar archivos, crear carpetas, renombrar, mover, copiar y eliminar elementos. También admite selección múltiple y evita sobrescribir nombres existentes añadiendo sufijos como `foto (1).jpg`.
+Permite subir y descargar archivos, subir carpetas completas conservando sus subcarpetas, crear carpetas, renombrar, mover, copiar y eliminar elementos. También admite selección múltiple y evita sobrescribir nombres existentes añadiendo sufijos como `foto (1).jpg`.
 
 ## Inicio rápido
 
